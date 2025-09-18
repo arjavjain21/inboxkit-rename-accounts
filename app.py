@@ -1,6 +1,8 @@
 import hashlib
 import io
 import os
+from typing import Optional
+
 import pandas as pd
 import streamlit as st
 from utils import setup_logger, parse_email, read_csv_robust
@@ -12,6 +14,18 @@ st.set_page_config(page_title="InboxKit UID Mapper and Updater", page_icon="📧
 
 st.title("📧 InboxKit UID Mapper and Updater")
 st.caption("Modern, minimal Streamlit tool to map mailbox UIDs from emails, then update user fields via InboxKit API.")
+
+
+def show_preview(placeholder, note: Optional[str] = None) -> None:
+    data = st.session_state.get("data")
+    if data is None:
+        placeholder.empty()
+        return
+    with placeholder.container():
+        if note:
+            st.caption(note)
+        st.dataframe(data.head(5))
+
 
 with st.sidebar:
     st.header("Configuration")
@@ -119,7 +133,8 @@ if uploaded:
         st.session_state["data"] = work
 
     st.subheader("Preview")
-    st.dataframe(st.session_state["data"].head(20))
+    preview_placeholder = st.empty()
+    show_preview(preview_placeholder)
 
     st.divider()
     st.subheader("Step 1: Map UIDs")
@@ -158,6 +173,7 @@ if uploaded:
             progress.progress((idx+1)/total, text=f"Mapping UIDs... {idx+1}/{total}")
         st.success(f"UID mapping finished. Found {found}, failed {bad}.")
         st.session_state["uid_mapped"] = True
+        show_preview(preview_placeholder, "Preview after UID mapping")
 
         csv = st.session_state["data"].to_csv(index=False).encode("utf-8")
         st.download_button("Download mapping CSV", data=csv, file_name="uid_mapping.csv", mime="text/csv")
@@ -218,6 +234,7 @@ if uploaded:
 
                 st.session_state["data"] = ready
                 st.success(f"Update complete. Success {ok}, failed {fail}.")
+                show_preview(preview_placeholder, "Preview after updates")
                 st.session_state["update_done"] = True
 
                 csv = ready.to_csv(index=False).encode("utf-8")
