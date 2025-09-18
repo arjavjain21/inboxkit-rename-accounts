@@ -249,6 +249,9 @@ if uploaded:
         invalid_domain_mask = normalized_domains == ""
         if invalid_domain_mask.any():
             st.session_state["data"].loc[invalid_domain_mask, "domain_uid_status"] = "Invalid domain"
+            logger.warning(
+                f"Domain lookup skipped for {int(invalid_domain_mask.sum())} rows: invalid domain"
+            )
 
         unique_domains = sorted(d for d in normalized_domains.unique() if d)
         domain_found = 0
@@ -260,34 +263,50 @@ if uploaded:
                 uid, err, code = client.get_domain_uid(domain_value)
                 mask = normalized_domains == domain_value
                 http_str = str(code) if code is not None else ""
+                http_display = http_str or "n/a"
                 if uid:
                     st.session_state["data"].loc[mask, "domain_uid"] = uid
                     st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                     st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
                     domain_found += 1
+                    logger.info(
+                        f"Domain lookup OK: {domain_value} -> {uid} (HTTP {http_display})"
+                    )
                 else:
                     st.session_state["data"].loc[mask, "domain_uid"] = None
                     st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
                     st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
                     domain_failed += 1
+                    logger.error(
+                        f"Domain lookup failed for {domain_value}: {err or 'Lookup failed'} (HTTP {http_display})"
+                    )
                 domain_progress.progress(
                     i / total_domains, text=f"Resolving domains... {i}/{total_domains}"
                 )
-        st.success(
+        summary_message = (
             "UID mapping finished. "
             f"Mailboxes found {found}, failed {bad}. "
             f"Domains resolved {domain_found}, failed {domain_failed}."
         )
+        st.success(summary_message)
+        logger.info(summary_message)
+        st.session_state["status_messages"].append(summary_message)
         st.session_state["uid_mapped"] = True
         show_preview(preview_placeholder, "Preview after UID mapping")
 
+    if st.session_state["uid_mapped"]:
         ordered_cols = _ordered_columns(st.session_state["data"])
-        csv = (
+        mapping_csv = (
             st.session_state["data"].loc[:, ordered_cols].to_csv(index=False).encode("utf-8")
         )
-        st.download_button("Download mapping CSV", data=csv, file_name="uid_mapping.csv", mime="text/csv")
+        st.download_button(
+            "Download mapping CSV",
+            data=mapping_csv,
+            file_name="uid_mapping.csv",
+            mime="text/csv",
+            key="download_mapping_csv",
+        )
 
-    if st.session_state["uid_mapped"]:
         data = st.session_state["data"]
         uid_missing = data["uid"].isna() | (data["uid"].astype(str).str.strip() == "")
         domain_missing = data["domain_uid"].isna() | (data["domain_uid"].astype(str).str.strip() == "")
@@ -387,10 +406,6 @@ if uploaded:
                 st.success(f"Update complete. Success {ok}, failed {fail}.")
                 show_preview(preview_placeholder, "Preview after updates")
                 st.session_state["update_done"] = True
-
-                ordered_cols = _ordered_columns(ready)
-                csv = ready.loc[:, ordered_cols].to_csv(index=False).encode("utf-8")
-                st.download_button("Download results CSV", data=csv, file_name="update_results.csv", mime="text/csv")
 
         st.divider()
         st.subheader("Step 3: Update Forwarding")
@@ -507,6 +522,7 @@ if uploaded:
                             domain_uid_value, payload
                         )
                         http_str = str(code) if code is not None else ""
+                        http_display = http_str or "n/a"
 
                         if success:
                             data_copy.loc[group.index, "forwarding_status"] = "OK"
@@ -514,7 +530,9 @@ if uploaded:
                             summary = (
                                 f"Forwarding updated for {domain_name} ({domain_uid_value})"
                             )
-                            logger.info(f"{summary}: {payload['forwarding_url']}")
+                            logger.info(
+                                f"{summary}: {payload['forwarding_url']} (HTTP {http_display})"
+                            )
                             success_count += 1
                         else:
                             error_detail = err or "Unknown error"
@@ -525,8 +543,8 @@ if uploaded:
                             message = (
                                 f"Forwarding failed for {domain_name} ({domain_uid_value}): {error_detail}"
                             )
-                            error_messages.append(message)
-                            logger.error(message)
+                            error_messages.append(f"{message} (HTTP {http_display})")
+                            logger.error(f"{message} (HTTP {http_display})")
 
                     progress.progress(1.0, text="Forwarding updates finished.")
 
@@ -553,6 +571,19 @@ if uploaded:
                             "Forwarding errors encountered:\n- "
                             + "\n- ".join(error_messages)
                         )
+
+        if st.session_state["update_done"]:
+            ordered_cols = _ordered_columns(st.session_state["data"])
+            results_csv = (
+                st.session_state["data"].loc[:, ordered_cols].to_csv(index=False).encode("utf-8")
+            )
+            st.download_button(
+                "Download results CSV",
+                data=results_csv,
+                file_name="update_results.csv",
+                mime="text/csv",
+                key="download_results_csv",
+            )
 
         st.divider()
         st.subheader("Status Updates")
