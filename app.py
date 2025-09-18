@@ -517,7 +517,30 @@ if uploaded:
                             logger.error(message)
                             continue
 
-                        payload = {"forwarding_url": unique_forwarding[0]}
+                        uid_values = (
+                            group["uid"].fillna("").astype(str).str.strip()
+                            if "uid" in group
+                            else pd.Series(dtype=str)
+                        )
+                        unique_mailbox_uids = sorted({uid for uid in uid_values if uid})
+
+                        if not unique_mailbox_uids:
+                            message = (
+                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
+                                "no mailbox UIDs available"
+                            )
+                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                            data_copy.loc[group.index, "forwarding_error"] = message
+                            failure_count += 1
+                            error_messages.append(message)
+                            logger.error(message)
+                            continue
+
+                        payload = {
+                            "domain_uid": domain_uid_value,
+                            "forwarding_url": unique_forwarding[0],
+                            "uids": unique_mailbox_uids,
+                        }
                         success, err, code = client.update_domain_forwarding(
                             domain_uid_value, payload
                         )
