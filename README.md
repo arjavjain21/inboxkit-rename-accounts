@@ -4,7 +4,7 @@ A professional Streamlit tool to:
 1. Upload a CSV of email accounts.
 2. Parse `username` and `domain` from each email.
 3. Map each email to its InboxKit **UID** using a lookup flow.
-4. Preview and manually fix missing UIDs if needed.
+4. Preview and manually fix missing UIDs if needed (grab values from the official `/v1/api/mailboxes/list` endpoint when you prefer a manual workflow).
 5. Update mailbox fields (`first_name`, `last_name`, `user_name`) via the **/v1/api/mailboxes/update** endpoint.
 6. View progress and logs. Download results as CSV.
 
@@ -66,15 +66,16 @@ For GitHub Actions or Codespaces you can store these as repository secrets and e
 Your API spec included the update endpoint. A UID lookup endpoint was not specified. The client implements a pragmatic sequence:
 - `GET /v1/api/mailboxes/find?email=...` (mode `email`)
 - `GET /v1/api/mailboxes/search?keyword={username}&domain={domain}` (mode `search`)
-- `GET /v1/api/mailboxes?email=...` (mode `list`)
+- `POST /v1/api/mailboxes/list` with `{"page": 1, "limit": 1, "keyword": username, "domain": domain}` and then filters the returned `mailboxes` array for the matching `username@domain` (mode `list`).
 
-Set `INBOXKIT_UID_LOOKUP_MODE` to force one. In `auto` the client tries all three and extracts a `uid` key from any JSON shape. If your actual endpoint differs, change the paths in `inboxkit_client.py` to match your API. The manual override editor in the UI lets you paste UIDs for rows that do not resolve automatically.
+Set `INBOXKIT_UID_LOOKUP_MODE` to force one. In `auto` the client tries all three, and the list mode now mirrors the official `/v1/api/mailboxes/list` endpoint behaviour (including the same filter payload). If your actual endpoint differs, change the paths in `inboxkit_client.py` to match your API. The manual override editor in the UI lets you paste UIDs for rows that do not resolve automatically—perfect for values collected directly from the `/v1/api/mailboxes/list` endpoint in your own tooling.
 
 ## Error handling
 
 - 401 Unauthorized: check the Bearer token.
 - 404 Not found during UID lookup: either mailbox does not exist or the endpoint path is wrong.
 - 4xx or 5xx responses are surfaced in the result table and logs.
+- List lookups raise a clear `No mailbox matching ...` message when the `/v1/api/mailboxes/list` response does not include the target email.
 - Network faults are retried with exponential backoff.
 
 ## Deployment
