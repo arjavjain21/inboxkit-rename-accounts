@@ -1,6 +1,5 @@
 import hashlib
 import io
-import os
 from typing import Optional
 
 import pandas as pd
@@ -9,6 +8,14 @@ from utils import setup_logger, parse_email, read_csv_robust
 from inboxkit_client import InboxKitClient, InboxKitError
 
 logger = setup_logger()
+
+config = st.secrets
+base_url = str(config.get("INBOXKIT_BASE_URL", "https://api.inboxkit.com")).strip()
+bearer = str(config.get("INBOXKIT_BEARER", "")).strip()
+workspace_id = str(config.get("INBOXKIT_WORKSPACE_ID", "")).strip()
+uid_lookup_mode = str(config.get("INBOXKIT_UID_LOOKUP_MODE", "auto")).strip().lower()
+if uid_lookup_mode not in {"auto", "email", "search", "list"}:
+    uid_lookup_mode = "auto"
 
 st.set_page_config(page_title="InboxKit UID Mapper and Updater", page_icon="📧", layout="wide")
 
@@ -29,21 +36,12 @@ def show_preview(placeholder, note: Optional[str] = None) -> None:
 
 with st.sidebar:
     st.header("Configuration")
-    st.write("Values can be pulled from environment variables or Streamlit secrets. You can override here for a session.")
-    default_base = st.secrets.get("INBOXKIT_BASE_URL", os.getenv("INBOXKIT_BASE_URL", "https://api.inboxkit.com"))
-    default_token = st.secrets.get("INBOXKIT_BEARER", os.getenv("INBOXKIT_BEARER", ""))
-    default_ws = st.secrets.get("INBOXKIT_WORKSPACE_ID", os.getenv("INBOXKIT_WORKSPACE_ID", ""))
-    default_mode = st.secrets.get("INBOXKIT_UID_LOOKUP_MODE", os.getenv("INBOXKIT_UID_LOOKUP_MODE", "auto"))
-
-    base_url = st.text_input("Base URL", value=default_base)
-    bearer = st.text_input("Bearer Token", value=default_token, type="password")
-    workspace_id = st.text_input("Workspace ID", value=default_ws)
-    uid_lookup_mode = st.selectbox("UID Lookup Mode", options=["auto", "email", "search", "list"], index=["auto","email","search","list"].index(default_mode if default_mode in ["auto","email","search","list"] else "auto"))
-
-    st.divider()
-    st.markdown("**Concurrency Settings**")
-    concurrency = st.slider("Requests concurrency (sequential is safer)", min_value=1, max_value=10, value=3)
-    st.caption("Increase carefully. Respect rate limits.")
+    st.caption("Configure these values via Streamlit secrets (see `.streamlit/secrets.toml`).")
+    st.text(f"Base URL: {base_url or 'Not set'}")
+    masked_token = f"{bearer[:4]}..." if bearer else "Not set"
+    st.text(f"Bearer Token: {masked_token}")
+    st.text(f"Workspace ID: {workspace_id or 'Not set'}")
+    st.text(f"UID Lookup Mode: {uid_lookup_mode}")
 
 st.info("Upload a CSV with at least an **email** column. Optional columns: **first_name**, **last_name**, **user_name**.")
 
@@ -145,6 +143,19 @@ if uploaded:
     st.write("We will try multiple lookup strategies unless you force a mode in the sidebar.")
 
     if st.button("Map UIDs now"):
+        missing = []
+        if not bearer:
+            missing.append("INBOXKIT_BEARER")
+        if not workspace_id:
+            missing.append("INBOXKIT_WORKSPACE_ID")
+        if missing:
+            st.error(
+                "Missing required InboxKit credentials: "
+                + ", ".join(missing)
+                + ". Update `.streamlit/secrets.toml` and restart the app."
+            )
+            st.stop()
+
         try:
             client = InboxKitClient(base_url=base_url, bearer=bearer, workspace_id=workspace_id, uid_lookup_mode=uid_lookup_mode)
         except InboxKitError as e:
