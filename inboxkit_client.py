@@ -277,11 +277,18 @@ class InboxKitClient:
             return False, "At least one mailbox UID is required", None
         forwarding_copy["uids"] = cleaned_uids
 
-        payload: Dict[str, Any] = {"uid": domain_uid}
-        payload.update(forwarding_copy)
+        normalized_domain_uid = domain_uid.strip()
+        if not normalized_domain_uid:
+            return False, "Domain UID is required", None
+        payload_domain_uid = str(forwarding_copy.get("domain_uid", "")).strip()
+        if not payload_domain_uid:
+            return False, "Forwarding payload must include domain_uid", None
+        if payload_domain_uid != normalized_domain_uid:
+            return False, "Domain UID mismatch between argument and payload", None
+        forwarding_copy["domain_uid"] = payload_domain_uid
 
         try:
-            resp = self._request("POST", "/v1/api/domains/forwarding", json=payload)
+            resp = self._request("POST", "/v1/api/domains/forwarding", json=forwarding_copy)
         except requests.RequestException as e:
             return False, f"Network error: {str(e)}", None
 
