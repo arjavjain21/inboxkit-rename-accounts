@@ -104,6 +104,10 @@ if uploaded:
         user_col = st.selectbox("Username column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(user_col) if user_col else 0)
 
         # Clean and prepare
+        user_series = None
+        if user_col != "<none>":
+            user_series = df[user_col].astype(str)
+
         work = df.copy()
         work.rename(columns={email_col: "email"}, inplace=True)
         work["email"] = work["email"].astype(str).str.strip().str.lower()
@@ -125,8 +129,8 @@ if uploaded:
             work["last_name"] = work[last_col].astype(str)
         else:
             work["last_name"] = ""
-        if user_col != "<none>":
-            work["user_name"] = work[user_col].astype(str)
+        if user_series is not None:
+            work["user_name"] = user_series
         else:
             work["user_name"] = ""
 
