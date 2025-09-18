@@ -281,21 +281,62 @@ if uploaded:
         st.download_button("Download mapping CSV", data=csv, file_name="uid_mapping.csv", mime="text/csv")
 
     if st.session_state["uid_mapped"]:
-        failed = st.session_state["data"][st.session_state["data"]["uid"].isna() | (st.session_state["data"]["uid"] == "")]
-        if not failed.empty:
-            st.warning(f"{len(failed)} rows have no UID. You can correct these manually below and click Apply Manual Fixes.")
-            manual = failed[["email", "uid"]].copy()
-            manual["uid"] = ""
-            edited = st.data_editor(manual, num_rows="dynamic", use_container_width=True, key="manual_uid_editor")
+        data = st.session_state["data"]
+        uid_missing = data["uid"].isna() | (data["uid"].astype(str).str.strip() == "")
+        domain_missing = data["domain_uid"].isna() | (data["domain_uid"].astype(str).str.strip() == "")
+        manual_mask = uid_missing | domain_missing
+        manual_rows = data.loc[manual_mask]
+        if not manual_rows.empty:
+            st.warning(
+                f"{len(manual_rows)} rows are missing mailbox or domain UIDs. "
+                "You can correct these manually below and click Apply Manual Fixes."
+            )
+            manual = manual_rows[["email", "domain", "uid", "domain_uid"]].copy()
+            manual.insert(0, "row_index", manual.index)
+            manual["uid"] = manual["uid"].fillna("").astype(str)
+            manual["domain_uid"] = manual["domain_uid"].fillna("").astype(str)
+            edited = st.data_editor(
+                manual,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="manual_uid_editor",
+                disabled=["row_index", "email", "domain"],
+            )
             if st.button("Apply Manual Fixes"):
-                # Merge edited values
+                updates = 0
                 for _, r in edited.iterrows():
-                    email = str(r["email"]).strip().lower()
-                    uid = str(r["uid"]).strip()
-                    mask = st.session_state["data"]["email"] == email
-                    st.session_state["data"].loc[mask, "uid"] = uid
-                    st.session_state["data"].loc[mask, "uid_status"] = "Manual"
-                st.success("Manual UIDs applied.")
+                    idx = r.get("row_index")
+                    if idx not in st.session_state["data"].index:
+                        continue
+                    raw_uid = r.get("uid")
+                    new_uid = "" if pd.isna(raw_uid) else str(raw_uid).strip()
+                    raw_domain_uid = r.get("domain_uid")
+                    new_domain_uid = "" if pd.isna(raw_domain_uid) else str(raw_domain_uid).strip()
+
+                    orig_uid = st.session_state["data"].at[idx, "uid"]
+                    orig_uid_str = "" if pd.isna(orig_uid) else str(orig_uid).strip()
+                    if new_uid != orig_uid_str:
+                        st.session_state["data"].at[idx, "uid"] = new_uid or None
+                        st.session_state["data"].at[idx, "uid_status"] = "Manual" if new_uid else ""
+                        st.session_state["data"].at[idx, "uid_http"] = ""
+                        updates += 1
+
+                    orig_domain_uid = st.session_state["data"].at[idx, "domain_uid"]
+                    orig_domain_uid_str = (
+                        "" if pd.isna(orig_domain_uid) else str(orig_domain_uid).strip()
+                    )
+                    if new_domain_uid != orig_domain_uid_str:
+                        st.session_state["data"].at[idx, "domain_uid"] = new_domain_uid or None
+                        st.session_state["data"].at[idx, "domain_uid_status"] = (
+                            "Manual" if new_domain_uid else ""
+                        )
+                        st.session_state["data"].at[idx, "domain_uid_http"] = ""
+                        updates += 1
+
+                if updates:
+                    st.success("Manual overrides applied.")
+                else:
+                    st.info("No manual overrides detected.")
 
         st.divider()
         st.subheader("Step 2: Update Mailboxes")
