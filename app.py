@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import pandas as pd
@@ -40,74 +41,85 @@ if "uid_mapped" not in st.session_state:
     st.session_state["uid_mapped"] = False
 if "update_done" not in st.session_state:
     st.session_state["update_done"] = False
+if "upload_token" not in st.session_state:
+    st.session_state["upload_token"] = None
 
 if uploaded:
-    # Need a fresh buffer per read attempt
-    file_bytes = io.BytesIO(uploaded.getvalue())
-    try:
-        df = read_csv_robust(file_bytes)
-    except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
-        st.stop()
+    file_bytes_raw = uploaded.getvalue()
+    token = hashlib.md5(file_bytes_raw).hexdigest()
+    new_upload = st.session_state.get("upload_token") != token
+    if new_upload:
+        st.session_state["upload_token"] = token
+        st.session_state["uid_mapped"] = False
+        st.session_state["update_done"] = False
 
-    # Normalize columns
-    df.columns = [c.strip() for c in df.columns]
-    # Make sure required column exists or allow selection
-    email_col = None
-    candidates = [c for c in df.columns if c.lower() in ("email", "emails", "email_id", "e-mail")]
-    if len(candidates) == 1:
-        email_col = candidates[0]
-    else:
-        email_col = st.selectbox("Select the email column", options=df.columns.tolist())
+    if st.session_state["data"] is None or new_upload:
+        # Need a fresh buffer per read attempt
+        file_bytes = io.BytesIO(file_bytes_raw)
+        try:
+            df = read_csv_robust(file_bytes)
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
+            st.stop()
 
-    # Optional fields
-    first_col = None
-    last_col = None
-    user_col = None
-    for c in df.columns:
-        lc = c.lower()
-        if lc == "first_name" or lc == "firstname":
-            first_col = c
-        if lc == "last_name" or lc == "lastname":
-            last_col = c
-        if lc == "user_name" or lc == "username":
-            user_col = c
+        # Normalize columns
+        df.columns = [c.strip() for c in df.columns]
+        # Make sure required column exists or allow selection
+        email_col = None
+        candidates = [c for c in df.columns if c.lower() in ("email", "emails", "email_id", "e-mail")]
+        if len(candidates) == 1:
+            email_col = candidates[0]
+        else:
+            email_col = st.selectbox("Select the email column", options=df.columns.tolist())
 
-    first_col = st.selectbox("First name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(first_col) if first_col else 0)
-    last_col = st.selectbox("Last name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(last_col) if last_col else 0)
-    user_col = st.selectbox("Username column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(user_col) if user_col else 0)
+        # Optional fields
+        first_col = None
+        last_col = None
+        user_col = None
+        for c in df.columns:
+            lc = c.lower()
+            if lc == "first_name" or lc == "firstname":
+                first_col = c
+            if lc == "last_name" or lc == "lastname":
+                last_col = c
+            if lc == "user_name" or lc == "username":
+                user_col = c
 
-    # Clean and prepare
-    work = df.copy()
-    work.rename(columns={email_col: "email"}, inplace=True)
-    work["email"] = work["email"].astype(str).str.strip().str.lower()
-    parsed = work["email"].apply(parse_email)
-    work["username"] = parsed.apply(lambda x: x[0] if x else None)
-    work["domain"] = parsed.apply(lambda x: x[1] if x else None)
-    work["uid"] = None
-    work["uid_status"] = ""
-    work["uid_http"] = ""
-    work["update_status"] = ""
-    work["update_http"] = ""
-    work["update_error"] = ""
+        first_col = st.selectbox("First name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(first_col) if first_col else 0)
+        last_col = st.selectbox("Last name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(last_col) if last_col else 0)
+        user_col = st.selectbox("Username column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(user_col) if user_col else 0)
 
-    if first_col != "<none>":
-        work["first_name"] = work[first_col].astype(str)
-    else:
-        work["first_name"] = ""
-    if last_col != "<none>":
-        work["last_name"] = work[last_col].astype(str)
-    else:
-        work["last_name"] = ""
-    if user_col != "<none>":
-        work["user_name"] = work[user_col].astype(str)
-    else:
-        work["user_name"] = ""
+        # Clean and prepare
+        work = df.copy()
+        work.rename(columns={email_col: "email"}, inplace=True)
+        work["email"] = work["email"].astype(str).str.strip().str.lower()
+        parsed = work["email"].apply(parse_email)
+        work["username"] = parsed.apply(lambda x: x[0] if x else None)
+        work["domain"] = parsed.apply(lambda x: x[1] if x else None)
+        work["uid"] = None
+        work["uid_status"] = ""
+        work["uid_http"] = ""
+        work["update_status"] = ""
+        work["update_http"] = ""
+        work["update_error"] = ""
+
+        if first_col != "<none>":
+            work["first_name"] = work[first_col].astype(str)
+        else:
+            work["first_name"] = ""
+        if last_col != "<none>":
+            work["last_name"] = work[last_col].astype(str)
+        else:
+            work["last_name"] = ""
+        if user_col != "<none>":
+            work["user_name"] = work[user_col].astype(str)
+        else:
+            work["user_name"] = ""
+
+        st.session_state["data"] = work
 
     st.subheader("Preview")
-    st.dataframe(work.head(20))
-
-    st.session_state["data"] = work
+    st.dataframe(st.session_state["data"].head(20))
 
     st.divider()
     st.subheader("Step 1: Map UIDs")
