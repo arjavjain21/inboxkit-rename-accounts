@@ -60,6 +60,44 @@ class InboxKitClient:
                     return found
         return None
 
+    def _find_uid_in_mailboxes(self, data: Any, username: str, domain: str) -> Optional[str]:
+        """Attempt to locate the UID for the given username/domain within a mailboxes array."""
+        target_username = (username or "").strip().lower()
+        target_domain = (domain or "").strip().lower()
+
+        def locate_mailboxes(payload: Any) -> Optional[List[Dict[str, Any]]]:
+            if payload is None:
+                return None
+            if isinstance(payload, dict):
+                mailboxes = payload.get("mailboxes")
+                if isinstance(mailboxes, list):
+                    return mailboxes
+                for value in payload.values():
+                    nested = locate_mailboxes(value)
+                    if nested is not None:
+                        return nested
+            elif isinstance(payload, list):
+                for item in payload:
+                    nested = locate_mailboxes(item)
+                    if nested is not None:
+                        return nested
+            return None
+
+        mailboxes = locate_mailboxes(data)
+        if not mailboxes:
+            return None
+
+        for mailbox in mailboxes:
+            if not isinstance(mailbox, dict):
+                continue
+            entry_username = str(mailbox.get("username", "")).strip().lower()
+            entry_domain = str(mailbox.get("domain_name", "")).strip().lower()
+            if entry_username == target_username and entry_domain == target_domain:
+                uid = mailbox.get("uid")
+                if isinstance(uid, str) and uid:
+                    return uid
+        return None
+
     def find_uid_by_email(self, email: str, username: str, domain: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
         """
         Attempt to find a mailbox UID by trying a few probable endpoints.
@@ -76,8 +114,8 @@ class InboxKitClient:
                     # Hypothetical search endpoint
                     resp = self._request("GET", "/v1/api/mailboxes/search", params={"keyword": username, "domain": domain})
                 elif mode == "list":
-                    # Hypothetical list with filter
-                    resp = self._request("GET", "/v1/api/mailboxes", params={"email": email})
+                    payload = {"page": 1, "limit": 1, "keyword": username, "domain": domain}
+                    resp = self._request("POST", "/v1/api/mailboxes/list", json=payload)
                 else:
                     return None, f"Invalid UID lookup mode: {mode}", None
 
@@ -95,6 +133,13 @@ class InboxKitClient:
                     data = resp.json()
                 except Exception:
                     return None, "Invalid JSON from UID lookup", resp.status_code
+                if mode == "list":
+                    matched_uid = self._find_uid_in_mailboxes(data, username, domain)
+                    if matched_uid:
+                        return matched_uid, None, resp.status_code
+                    tried.append((mode, f"No mailbox matching {email} in list response", resp.status_code))
+                    continue
+
                 uid = self._extract_uid(data)
                 if uid:
                     return uid, None, resp.status_code
