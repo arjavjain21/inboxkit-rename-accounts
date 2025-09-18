@@ -216,7 +216,7 @@ if uploaded:
         progress = st.progress(0, text="Starting UID mapping...")
         found = 0
         bad = 0
-        for idx in st.session_state["data"].index:
+        for i, idx in enumerate(st.session_state["data"].index, start=1):
             row = st.session_state["data"].loc[idx]
             email = row["email"]
             username = row["username"]
@@ -235,8 +235,42 @@ if uploaded:
                     st.session_state["data"].at[idx, "uid_status"] = err or "Lookup failed"
                     st.session_state["data"].at[idx, "uid_http"] = str(code or "")
                     bad += 1
-            progress.progress((idx+1)/total, text=f"Mapping UIDs... {idx+1}/{total}")
-        st.success(f"UID mapping finished. Found {found}, failed {bad}.")
+            progress.progress(i / total, text=f"Mapping UIDs... {i}/{total}")
+
+        domain_series = st.session_state["data"]["domain"].fillna("").astype(str)
+        normalized_domains = domain_series.str.strip().str.lower()
+        invalid_domain_mask = normalized_domains == ""
+        if invalid_domain_mask.any():
+            st.session_state["data"].loc[invalid_domain_mask, "domain_uid_status"] = "Invalid domain"
+
+        unique_domains = sorted(d for d in normalized_domains.unique() if d)
+        domain_found = 0
+        domain_failed = 0
+        if unique_domains:
+            domain_progress = st.progress(0, text="Resolving domains...")
+            total_domains = len(unique_domains)
+            for i, domain_value in enumerate(unique_domains, start=1):
+                uid, err, code = client.get_domain_uid(domain_value)
+                mask = normalized_domains == domain_value
+                http_str = str(code) if code is not None else ""
+                if uid:
+                    st.session_state["data"].loc[mask, "domain_uid"] = uid
+                    st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
+                    st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
+                    domain_found += 1
+                else:
+                    st.session_state["data"].loc[mask, "domain_uid"] = None
+                    st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
+                    st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
+                    domain_failed += 1
+                domain_progress.progress(
+                    i / total_domains, text=f"Resolving domains... {i}/{total_domains}"
+                )
+        st.success(
+            "UID mapping finished. "
+            f"Mailboxes found {found}, failed {bad}. "
+            f"Domains resolved {domain_found}, failed {domain_failed}."
+        )
         st.session_state["uid_mapped"] = True
         show_preview(preview_placeholder, "Preview after UID mapping")
 
