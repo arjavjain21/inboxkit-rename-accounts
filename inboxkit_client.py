@@ -17,6 +17,7 @@ class InboxKitClient:
         self.uid_lookup_mode = (uid_lookup_mode or os.getenv("INBOXKIT_UID_LOOKUP_MODE") or "auto").lower()
         if not self.bearer or not self.workspace_id:
             raise InboxKitError("Missing credentials. Set INBOXKIT_BEARER and INBOXKIT_WORKSPACE_ID as environment variables or Streamlit secrets.")
+        self._domain_cache: Dict[str, Tuple[Optional[str], Optional[str], Optional[int]]] = {}
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -165,6 +166,74 @@ class InboxKitClient:
             return False, "Unauthorized. Check Bearer token.", resp.status_code
         if resp.status_code == 404:
             return False, "Mailbox not found", resp.status_code
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"message": resp.text[:200]}
+            msg = body.get("message") or body.get("error") or str(body)
+            return False, f"HTTP {resp.status_code}: {msg}", resp.status_code
+        return True, None, resp.status_code
+
+    def find_domain_uid(self, domain: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+        domain_key = (domain or "").strip().lower()
+        if not domain_key:
+            return None, "Invalid domain", None
+
+        if domain_key in self._domain_cache:
+            return self._domain_cache[domain_key]
+
+        payload: Dict[str, Any] = {"page": 1, "limit": 50, "keywords": domain_key}
+        try:
+            resp = self._request("POST", "/v1/api/domains/list", json=payload)
+        except requests.RequestException as exc:
+            result = (None, f"Network error: {exc}", None)
+            self._domain_cache[domain_key] = result
+            return result
+
+        if resp.status_code == 401:
+            result = (None, "Unauthorized. Check Bearer token.", resp.status_code)
+            self._domain_cache[domain_key] = result
+            return result
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"message": resp.text[:200]}
+            msg = body.get("message") or body.get("error") or str(body)
+            result = (None, f"HTTP {resp.status_code}: {msg}", resp.status_code)
+            self._domain_cache[domain_key] = result
+            return result
+
+        try:
+            data = resp.json()
+        except Exception:
+            result = (None, "Invalid JSON from domain lookup", resp.status_code)
+            self._domain_cache[domain_key] = result
+            return result
+
+        domains = data.get("domains")
+        if isinstance(domains, list):
+            for entry in domains:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name", "")).strip().lower()
+                if name == domain_key:
+                    uid = entry.get("uid")
+                    if isinstance(uid, str) and uid:
+                        result = (uid, None, resp.status_code)
+                        self._domain_cache[domain_key] = result
+                        return result
+
+        result = (None, f"Domain {domain} not found", resp.status_code)
+        self._domain_cache[domain_key] = result
+        return result
+
+    def set_domain_forwarding(self, domain_uids: List[str], forwarding_url: str) -> Tuple[bool, Optional[str], Optional[int]]:
+        payload: Dict[str, Any] = {"uids": domain_uids, "forwarding_url": forwarding_url}
+        resp = self._request("POST", "/v1/api/domains/forwarding", json=payload)
+        if resp.status_code == 401:
+            return False, "Unauthorized. Check Bearer token.", resp.status_code
         if resp.status_code >= 400:
             try:
                 body = resp.json()
