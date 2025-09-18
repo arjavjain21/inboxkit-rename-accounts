@@ -1,6 +1,6 @@
 import hashlib
 import io
-from typing import Optional
+from typing import List, Optional
 
 import pandas as pd
 import streamlit as st
@@ -23,6 +23,33 @@ st.title("📧 InboxKit UID Mapper and Updater")
 st.caption("Modern, minimal Streamlit tool to map mailbox UIDs from emails, then update user fields via InboxKit API.")
 
 
+def _ordered_columns(df: pd.DataFrame) -> List[str]:
+    """Return preferred column order for display/export while keeping extras."""
+
+    preferred = [
+        "email",
+        "username",
+        "domain",
+        "uid",
+        "uid_status",
+        "uid_http",
+        "domain_uid",
+        "domain_uid_status",
+        "domain_uid_http",
+        "forwarding_url",
+        "forwarding_status",
+        "update_status",
+        "update_http",
+        "update_error",
+        "first_name",
+        "last_name",
+        "user_name",
+    ]
+    ordered = [col for col in preferred if col in df.columns]
+    ordered.extend(col for col in df.columns if col not in ordered)
+    return ordered
+
+
 def show_preview(placeholder, note: Optional[str] = None) -> None:
     data = st.session_state.get("data")
     if data is None:
@@ -31,7 +58,8 @@ def show_preview(placeholder, note: Optional[str] = None) -> None:
     with placeholder.container():
         if note:
             st.caption(note)
-        st.dataframe(data.head(5))
+        ordered_cols = _ordered_columns(data)
+        st.dataframe(data.loc[:, ordered_cols].head(5))
 
 
 with st.sidebar:
@@ -212,7 +240,10 @@ if uploaded:
         st.session_state["uid_mapped"] = True
         show_preview(preview_placeholder, "Preview after UID mapping")
 
-        csv = st.session_state["data"].to_csv(index=False).encode("utf-8")
+        ordered_cols = _ordered_columns(st.session_state["data"])
+        csv = (
+            st.session_state["data"].loc[:, ordered_cols].to_csv(index=False).encode("utf-8")
+        )
         st.download_button("Download mapping CSV", data=csv, file_name="uid_mapping.csv", mime="text/csv")
 
     if st.session_state["uid_mapped"]:
@@ -274,7 +305,8 @@ if uploaded:
                 show_preview(preview_placeholder, "Preview after updates")
                 st.session_state["update_done"] = True
 
-                csv = ready.to_csv(index=False).encode("utf-8")
+                ordered_cols = _ordered_columns(ready)
+                csv = ready.loc[:, ordered_cols].to_csv(index=False).encode("utf-8")
                 st.download_button("Download results CSV", data=csv, file_name="update_results.csv", mime="text/csv")
 
     st.divider()
