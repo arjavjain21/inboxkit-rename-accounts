@@ -130,6 +130,11 @@ if uploaded:
         work["uid"] = None
         work["uid_status"] = ""
         work["uid_http"] = ""
+        work["domain_uid"] = None
+        work["domain_uid_status"] = ""
+        work["domain_uid_http"] = ""
+        work["forwarding_url"] = ""
+        work["forwarding_status"] = ""
         work["update_status"] = ""
         work["update_http"] = ""
         work["update_error"] = ""
@@ -148,8 +153,6 @@ if uploaded:
             work["user_name"] = ""
         if forward_series is not None:
             work["forwarding_url"] = forward_series
-        else:
-            work["forwarding_url"] = ""
 
         st.session_state["data"] = work
 
