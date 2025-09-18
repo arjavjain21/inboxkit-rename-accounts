@@ -43,7 +43,9 @@ with st.sidebar:
     st.text(f"Workspace ID: {workspace_id or 'Not set'}")
     st.text(f"UID Lookup Mode: {uid_lookup_mode}")
 
-st.info("Upload a CSV with at least an **email** column. Optional columns: **first_name**, **last_name**, **user_name**.")
+st.info(
+    "Upload a CSV with at least an **email** column. Optional columns: **first_name**, **last_name**, **user_name**, forwarding settings such as **forwarding_url** or **forwarding_to**."
+)
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
@@ -88,6 +90,7 @@ if uploaded:
         first_col = None
         last_col = None
         user_col = None
+        forward_col = None
         for c in df.columns:
             lc = c.lower()
             if lc == "first_name" or lc == "firstname":
@@ -96,15 +99,27 @@ if uploaded:
                 last_col = c
             if lc == "user_name" or lc == "username":
                 user_col = c
+            normalized_forward = lc.replace("-", "_").replace(" ", "_")
+            if normalized_forward in {
+                "forwarding_url",
+                "forwarding_to",
+                "forward_to",
+                "forwarding",
+            }:
+                forward_col = c
 
         first_col = st.selectbox("First name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(first_col) if first_col else 0)
         last_col = st.selectbox("Last name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(last_col) if last_col else 0)
         user_col = st.selectbox("Username column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(user_col) if user_col else 0)
+        forward_col = st.selectbox("Forwarding URL column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(forward_col) if forward_col else 0)
 
         # Clean and prepare
         user_series = None
         if user_col != "<none>":
             user_series = df[user_col].astype(str)
+        forward_series = None
+        if forward_col != "<none>":
+            forward_series = df[forward_col].fillna("").astype(str).str.strip()
 
         work = df.copy()
         work.rename(columns={email_col: "email"}, inplace=True)
@@ -131,6 +146,10 @@ if uploaded:
             work["user_name"] = user_series
         else:
             work["user_name"] = ""
+        if forward_series is not None:
+            work["forwarding_url"] = forward_series
+        else:
+            work["forwarding_url"] = ""
 
         st.session_state["data"] = work
 
