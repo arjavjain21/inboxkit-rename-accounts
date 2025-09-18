@@ -266,8 +266,19 @@ class InboxKitClient:
         if not isinstance(forwarding, dict):
             return False, "Forwarding payload must be a dictionary", None
 
+        forwarding_copy: Dict[str, Any] = dict(forwarding)
+        raw_uids = forwarding_copy.get("uids")
+        if raw_uids is None:
+            return False, "Forwarding payload must include mailbox UIDs", None
+        if not isinstance(raw_uids, list):
+            return False, "UIDs must be provided as a list", None
+        cleaned_uids = [str(uid).strip() for uid in raw_uids if str(uid).strip()]
+        if not cleaned_uids:
+            return False, "At least one mailbox UID is required", None
+        forwarding_copy["uids"] = cleaned_uids
+
         payload: Dict[str, Any] = {"uid": domain_uid}
-        payload.update(forwarding)
+        payload.update(forwarding_copy)
 
         try:
             resp = self._request("POST", "/v1/api/domains/forwarding", json=payload)
