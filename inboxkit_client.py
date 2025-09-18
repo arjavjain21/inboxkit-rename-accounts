@@ -259,33 +259,47 @@ class InboxKitClient:
             return uid, None, resp.status_code
         return None, f"Domain {domain} not found in response", resp.status_code
 
-    def update_domain_forwarding(self, domain_uid: str, forwarding: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[int]]:
+    def update_domain_forwarding(self, domain_uid: Any, forwarding: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[int]]:
         """Update domain forwarding settings via /v1/api/domains/forwarding."""
-        if not domain_uid or not isinstance(domain_uid, str):
-            return False, "Domain UID is required", None
         if not isinstance(forwarding, dict):
             return False, "Forwarding payload must be a dictionary", None
 
-        forwarding_copy: Dict[str, Any] = dict(forwarding)
-        raw_uids = forwarding_copy.get("uids")
-        if raw_uids is None:
-            return False, "Forwarding payload must include mailbox UIDs", None
-        if not isinstance(raw_uids, list):
-            return False, "UIDs must be provided as a list", None
-        cleaned_uids = [str(uid).strip() for uid in raw_uids if str(uid).strip()]
-        if not cleaned_uids:
-            return False, "At least one mailbox UID is required", None
-        forwarding_copy["uids"] = cleaned_uids
+        # Normalise domain UID(s) into a list of non-empty strings.
+        if isinstance(domain_uid, (list, tuple, set)):
+            domain_uid_values = [str(uid).strip() for uid in domain_uid if str(uid).strip()]
+        else:
+            domain_uid_values = [str(domain_uid).strip()] if domain_uid is not None else []
 
-        normalized_domain_uid = domain_uid.strip()
-        if not normalized_domain_uid:
+        if not domain_uid_values:
             return False, "Domain UID is required", None
-        payload_domain_uid = str(forwarding_copy.get("domain_uid", "")).strip()
-        if not payload_domain_uid:
-            return False, "Forwarding payload must include domain_uid", None
-        if payload_domain_uid != normalized_domain_uid:
-            return False, "Domain UID mismatch between argument and payload", None
-        forwarding_copy["domain_uid"] = payload_domain_uid
+
+        forwarding_copy: Dict[str, Any] = dict(forwarding)
+        forwarding_copy.pop("domain_uid", None)
+
+        raw_uids = forwarding_copy.get("uids")
+        cleaned_forwarding_uids: List[str] = []
+        if raw_uids is None:
+            cleaned_forwarding_uids = []
+        elif isinstance(raw_uids, list):
+            cleaned_forwarding_uids = [str(uid).strip() for uid in raw_uids if str(uid).strip()]
+        else:
+            return False, "UIDs must be provided as a list when supplied", None
+
+        # Merge domain UID(s) first to guarantee their presence, then any caller-supplied UIDs.
+        merged_uids: List[str] = []
+        for uid in domain_uid_values + cleaned_forwarding_uids:
+            if uid and uid not in merged_uids:
+                merged_uids.append(uid)
+
+        if not merged_uids:
+            return False, "At least one UID is required", None
+
+        forwarding_url = str(forwarding_copy.get("forwarding_url", "")).strip()
+        if not forwarding_url:
+            return False, "Forwarding URL is required", None
+
+        forwarding_copy["forwarding_url"] = forwarding_url
+        forwarding_copy["uids"] = merged_uids
 
         try:
             resp = self._request("POST", "/v1/api/domains/forwarding", json=forwarding_copy)
