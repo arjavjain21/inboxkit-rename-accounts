@@ -38,6 +38,8 @@ def _ordered_columns(df: pd.DataFrame) -> List[str]:
         "domain_uid_http",
         "forwarding_url",
         "forwarding_status",
+        "forwarding_http",
+        "forwarding_error",
         "update_status",
         "update_http",
         "update_error",
@@ -85,6 +87,8 @@ if "update_done" not in st.session_state:
     st.session_state["update_done"] = False
 if "upload_token" not in st.session_state:
     st.session_state["upload_token"] = None
+if "status_messages" not in st.session_state:
+    st.session_state["status_messages"] = []
 
 if uploaded:
     file_bytes_raw = uploaded.getvalue()
@@ -94,6 +98,7 @@ if uploaded:
         st.session_state["upload_token"] = token
         st.session_state["uid_mapped"] = False
         st.session_state["update_done"] = False
+        st.session_state["status_messages"] = []
 
     if st.session_state["data"] is None or new_upload:
         # Need a fresh buffer per read attempt
@@ -163,6 +168,8 @@ if uploaded:
         work["domain_uid_http"] = ""
         work["forwarding_url"] = ""
         work["forwarding_status"] = ""
+        work["forwarding_http"] = ""
+        work["forwarding_error"] = ""
         work["update_status"] = ""
         work["update_http"] = ""
         work["update_error"] = ""
@@ -342,7 +349,8 @@ if uploaded:
         st.subheader("Step 2: Update Mailboxes")
 
         ready = st.session_state["data"].copy()
-        missing_uid = ready["uid"].isna() | (ready["uid"] == "")
+        uid_series = ready["uid"].fillna("").astype(str).str.strip()
+        missing_uid = uid_series == ""
         if missing_uid.any():
             st.error("Some rows still have missing UID. Fix those first.")
         else:
@@ -383,6 +391,176 @@ if uploaded:
                 ordered_cols = _ordered_columns(ready)
                 csv = ready.loc[:, ordered_cols].to_csv(index=False).encode("utf-8")
                 st.download_button("Download results CSV", data=csv, file_name="update_results.csv", mime="text/csv")
+
+        st.divider()
+        st.subheader("Step 3: Update Forwarding")
+
+        current = st.session_state["data"].copy()
+        uid_required = current["uid"].fillna("").astype(str).str.strip()
+        domain_required = current["domain_uid"].fillna("").astype(str).str.strip()
+        forwarding_required = current["forwarding_url"].fillna("").astype(str).str.strip()
+
+        missing_uid_forward = uid_required == ""
+        missing_domain_uid = domain_required == ""
+        missing_forwarding_url = forwarding_required == ""
+
+        validation_messages: List[str] = []
+        if missing_uid_forward.any():
+            validation_messages.append(
+                f"{int(missing_uid_forward.sum())} rows missing mailbox UID"
+            )
+        if missing_domain_uid.any():
+            validation_messages.append(
+                f"{int(missing_domain_uid.sum())} rows missing domain UID"
+            )
+        if missing_forwarding_url.any():
+            validation_messages.append(
+                f"{int(missing_forwarding_url.sum())} rows missing forwarding URL"
+            )
+
+        if validation_messages:
+            details = "\n- " + "\n- ".join(validation_messages)
+            st.error(
+                "Cannot update forwarding until all required fields are populated:" + details
+            )
+        else:
+            if st.button("Update Forwarding"):
+                try:
+                    client = InboxKitClient(
+                        base_url=base_url,
+                        bearer=bearer,
+                        workspace_id=workspace_id,
+                        uid_lookup_mode=uid_lookup_mode,
+                    )
+                except InboxKitError as e:
+                    st.error(str(e))
+                    st.stop()
+
+                data_copy = current.copy()
+                data_copy.loc[:, "forwarding_status"] = ""
+                data_copy.loc[:, "forwarding_http"] = ""
+                data_copy.loc[:, "forwarding_error"] = ""
+
+                domain_groups = []
+                for domain_uid_value, group in data_copy.groupby("domain_uid"):
+                    domain_uid_str = str(domain_uid_value).strip()
+                    if not domain_uid_str:
+                        continue
+                    domain_groups.append((domain_uid_str, group))
+
+                if not domain_groups:
+                    st.info("No domains available for forwarding updates.")
+                else:
+                    progress = st.progress(0, text="Starting forwarding updates...")
+                    total_domains = len(domain_groups)
+                    success_count = 0
+                    failure_count = 0
+                    error_messages: List[str] = []
+
+                    for i, (domain_uid_value, group) in enumerate(domain_groups, start=1):
+                        domain_values = (
+                            group.get("domain", pd.Series(dtype=str))
+                            .fillna("")
+                            .astype(str)
+                            .str.strip()
+                        )
+                        domain_name = next(
+                            (d for d in domain_values if d), domain_uid_value
+                        )
+
+                        forwarding_values = (
+                            group["forwarding_url"].fillna("").astype(str).str.strip()
+                        )
+                        unique_forwarding = sorted({v for v in forwarding_values if v})
+
+                        progress.progress(
+                            min(i / total_domains, 1.0),
+                            text=f"Updating forwarding... {i}/{total_domains}",
+                        )
+
+                        if not unique_forwarding:
+                            message = (
+                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): no forwarding URL provided"
+                            )
+                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                            data_copy.loc[group.index, "forwarding_error"] = message
+                            failure_count += 1
+                            error_messages.append(message)
+                            logger.error(message)
+                            continue
+
+                        if len(unique_forwarding) > 1:
+                            joined_urls = ", ".join(unique_forwarding)
+                            message = (
+                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
+                                f"multiple forwarding URLs found ({joined_urls})"
+                            )
+                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                            data_copy.loc[group.index, "forwarding_error"] = message
+                            failure_count += 1
+                            error_messages.append(message)
+                            logger.error(message)
+                            continue
+
+                        payload = {"forwarding_url": unique_forwarding[0]}
+                        success, err, code = client.update_domain_forwarding(
+                            domain_uid_value, payload
+                        )
+                        http_str = str(code) if code is not None else ""
+
+                        if success:
+                            data_copy.loc[group.index, "forwarding_status"] = "OK"
+                            data_copy.loc[group.index, "forwarding_http"] = http_str
+                            summary = (
+                                f"Forwarding updated for {domain_name} ({domain_uid_value})"
+                            )
+                            logger.info(f"{summary}: {payload['forwarding_url']}")
+                            success_count += 1
+                        else:
+                            error_detail = err or "Unknown error"
+                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                            data_copy.loc[group.index, "forwarding_http"] = http_str
+                            data_copy.loc[group.index, "forwarding_error"] = error_detail
+                            failure_count += 1
+                            message = (
+                                f"Forwarding failed for {domain_name} ({domain_uid_value}): {error_detail}"
+                            )
+                            error_messages.append(message)
+                            logger.error(message)
+
+                    progress.progress(1.0, text="Forwarding updates finished.")
+
+                    st.session_state["data"] = data_copy
+                    show_preview(
+                        preview_placeholder, "Preview after forwarding updates"
+                    )
+
+                    summary_message = (
+                        f"Forwarding update complete. Domains success {success_count}, failed {failure_count}."
+                    )
+                    logger.info(summary_message)
+                    if failure_count:
+                        st.warning(summary_message)
+                    else:
+                        st.success(summary_message)
+
+                    st.session_state["status_messages"].append(summary_message)
+                    for msg in error_messages:
+                        st.session_state["status_messages"].append(msg)
+
+                    if error_messages:
+                        st.error(
+                            "Forwarding errors encountered:\n- "
+                            + "\n- ".join(error_messages)
+                        )
+
+        st.divider()
+        st.subheader("Status Updates")
+        if st.session_state["status_messages"]:
+            for msg in st.session_state["status_messages"][-50:]:
+                st.write(f"- {msg}")
+        else:
+            st.caption("No status updates yet.")
 
     st.divider()
     st.subheader("Logs")
