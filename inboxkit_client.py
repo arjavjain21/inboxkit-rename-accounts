@@ -1,6 +1,7 @@
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Sequence
 import os
 import requests
+import logging
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 class InboxKitError(Exception):
@@ -10,7 +11,10 @@ class InboxKitClient:
     """
     Minimal client for InboxKit API with resilient calls.
     """
+    SMARTLEAD_SEQUENCER_UID = "33d23a0a-e5fc-42b6-93ae-49775fac3a40"
+
     def __init__(self, base_url: Optional[str] = None, bearer: Optional[str] = None, workspace_id: Optional[str] = None, uid_lookup_mode: Optional[str] = None):
+        self._logger = logging.getLogger(__name__)
         self.base_url = (base_url or os.getenv("INBOXKIT_BASE_URL") or "https://api.inboxkit.com").rstrip("/")
         self.bearer = bearer or os.getenv("INBOXKIT_BEARER")
         self.workspace_id = workspace_id or os.getenv("INBOXKIT_WORKSPACE_ID")
@@ -317,4 +321,59 @@ class InboxKitClient:
                 body = {"message": resp.text[:200]}
             msg = body.get("message") or body.get("error") or str(body)
             return False, f"HTTP {resp.status_code}: {msg}", resp.status_code
+        return True, None, resp.status_code
+
+    def export_inboxes_to_smartlead(self, mailbox_uids: Sequence[Any]) -> Tuple[bool, Optional[str], Optional[int]]:
+        """Trigger export of provided mailbox UIDs to the Smartlead sequencer."""
+        if mailbox_uids is None:
+            return False, "Mailbox UIDs are required", None
+
+        unique_uids: List[str] = []
+        for raw in mailbox_uids:
+            uid = "" if raw is None else str(raw).strip()
+            if uid and uid not in unique_uids:
+                unique_uids.append(uid)
+
+        if not unique_uids:
+            return False, "At least one mailbox UID is required", None
+
+        payload = {
+            "sequencer_uid": self.SMARTLEAD_SEQUENCER_UID,
+            "mailbox_uids": unique_uids,
+        }
+
+        self._logger.info(
+            "Exporting %s mailbox(es) to Smartlead sequencer %s", len(unique_uids), self.SMARTLEAD_SEQUENCER_UID
+        )
+
+        try:
+            resp = self._request("POST", "/v1/api/sequencers/export", json=payload)
+        except requests.RequestException as exc:
+            error_message = f"Network error: {exc}"
+            self._logger.error("Smartlead export failed: %s", error_message)
+            return False, error_message, None
+
+        if resp.status_code == 401:
+            message = "Unauthorized. Check Bearer token."
+            self._logger.error("Smartlead export failed: %s", message)
+            return False, message, resp.status_code
+
+        if resp.status_code == 404:
+            message = "Sequencer not found"
+            self._logger.error("Smartlead export failed: %s", message)
+            return False, message, resp.status_code
+
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"message": resp.text[:200]}
+            msg = body.get("message") or body.get("error") or str(body)
+            error_message = f"HTTP {resp.status_code}: {msg}"
+            self._logger.error("Smartlead export failed: %s", error_message)
+            return False, error_message, resp.status_code
+
+        self._logger.info(
+            "Smartlead export succeeded for %s mailbox(es) (HTTP %s)", len(unique_uids), resp.status_code
+        )
         return True, None, resp.status_code

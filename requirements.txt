@@ -5,3 +5,4 @@ python-dotenv>=1.0.1
 tenacity>=9.0.0
 tqdm>=4.66.4
 pyyaml>=6.0.2
+pytest>=8.2.2
