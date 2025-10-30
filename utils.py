@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 import pandas as pd
 
 EMAIL_REGEX = re.compile(r"^\s*([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*$")
@@ -62,3 +62,67 @@ def read_csv_robust(file_bytes, fallback_encoding="utf-8"):
                 pass
             continue
     raise ValueError("Could not parse CSV. Please upload a valid CSV file.")
+
+
+def annotate_skip_statuses(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    message: str,
+    columns: Iterable[str] = ("update", "forwarding", "smartlead"),
+) -> pd.DataFrame:
+    """Mark rows as skipped for the provided operation columns.
+
+    Parameters
+    ----------
+    df:
+        DataFrame to annotate. Columns are created if missing.
+    mask:
+        Boolean mask aligned with ``df.index`` identifying rows to mark as skipped.
+    message:
+        Human readable explanation recorded in the ``*_error`` columns.
+    columns:
+        Iterable selecting which operation families to annotate. Supported values
+        are ``"update"``, ``"forwarding"`` and ``"smartlead"``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The same DataFrame instance with in-place updates for the selected rows.
+    """
+
+    if df is None:
+        raise ValueError("DataFrame is required")
+
+    valid_mask = pd.Series(mask, index=df.index)
+    if not valid_mask.any():
+        return df
+
+    column_map = {
+        "update": ("update_status", "update_http", "update_error"),
+        "forwarding": (
+            "forwarding_status",
+            "forwarding_http",
+            "forwarding_error",
+        ),
+        "smartlead": (
+            "smartlead_export_status",
+            "smartlead_export_http",
+            "smartlead_export_error",
+        ),
+    }
+
+    selected_columns = [column_map[name] for name in columns if name in column_map]
+
+    for status_col, http_col, error_col in selected_columns:
+        if status_col not in df.columns:
+            df[status_col] = ""
+        if http_col not in df.columns:
+            df[http_col] = ""
+        if error_col not in df.columns:
+            df[error_col] = ""
+
+        df.loc[valid_mask, status_col] = "Skipped"
+        df.loc[valid_mask, http_col] = ""
+        df.loc[valid_mask, error_col] = message
+
+    return df
