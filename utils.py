@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 
 EMAIL_REGEX = re.compile(r"^\s*([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*$")
@@ -126,3 +126,102 @@ def annotate_skip_statuses(
         df.loc[valid_mask, error_col] = message
 
     return df
+
+
+def evaluate_smartlead_export(
+    forwarding_success: bool,
+    updates_ok: bool,
+    mailbox_uids: Sequence[str],
+) -> Tuple[List[str], bool, str, str]:
+    """Determine Smartlead export eligibility and user-facing messaging.
+
+    Returns
+    -------
+    tuple
+        ``(eligible_uids, ready, message, level)`` where ``eligible_uids`` is a
+        de-duplicated list of non-empty mailbox UIDs, ``ready`` indicates
+        whether the export button should be displayed, ``message`` contains the
+        status text to surface to the user, and ``level`` is either ``"info"``
+        or ``"warning"`` to aid in logging/UI severity selection.
+    """
+
+    normalized = [str(uid).strip() for uid in mailbox_uids if uid is not None]
+    eligible = [uid for uid in dict.fromkeys(normalized) if uid]
+
+    if forwarding_success and updates_ok and eligible:
+        message = (
+            f"Smartlead export ready for {len(eligible)} mailbox(es). "
+            "Click \"Export Inboxes\" to proceed."
+        )
+        return eligible, True, message, "info"
+
+    if forwarding_success and updates_ok:
+        message = "Smartlead export skipped: no mailbox UIDs available."
+        return eligible, False, message, "info"
+
+    if not forwarding_success:
+        message = "Smartlead export skipped due to forwarding errors."
+        return eligible, False, message, "warning"
+
+    message = "Smartlead export skipped due to mailbox update errors."
+    return eligible, False, message, "warning"
+
+
+def apply_smartlead_export_outcome(
+    df: pd.DataFrame,
+    eligible_mask: pd.Series,
+    eligible_uids: Sequence[str],
+    export_success: bool,
+    export_error: Optional[str],
+    export_code: Optional[int],
+) -> Tuple[pd.DataFrame, str, str, str, str, bool]:
+    """Update Smartlead export columns based on the API response.
+
+    Parameters
+    ----------
+    df:
+        DataFrame to update.
+    eligible_mask:
+        Boolean mask indicating which rows were part of the export attempt.
+    eligible_uids:
+        Sequence of unique mailbox UIDs submitted to the export endpoint.
+    export_success:
+        Result flag returned by ``InboxKitClient.export_inboxes_to_smartlead``.
+    export_error:
+        Error message returned by the client when ``export_success`` is false.
+    export_code:
+        Optional HTTP status code returned by the client.
+
+    Returns
+    -------
+    tuple
+        ``(updated_df, message, http_display, severity, log_level, done)``
+        where ``severity`` is either ``"success"`` or ``"error"`` and
+        ``log_level`` is ``"info"`` or ``"error"``.
+    """
+
+    if df is None:
+        raise ValueError("DataFrame is required")
+
+    http_str = str(export_code) if export_code is not None else ""
+    http_display = http_str or "n/a"
+
+    if "smartlead_export_status" not in df.columns:
+        df["smartlead_export_status"] = ""
+    if "smartlead_export_http" not in df.columns:
+        df["smartlead_export_http"] = ""
+    if "smartlead_export_error" not in df.columns:
+        df["smartlead_export_error"] = ""
+
+    if export_success:
+        df.loc[eligible_mask, "smartlead_export_status"] = "OK"
+        df.loc[eligible_mask, "smartlead_export_http"] = http_str
+        df.loc[eligible_mask, "smartlead_export_error"] = ""
+        message = f"Smartlead export triggered for {len(eligible_uids)} mailbox(es)."
+        return df, message, http_display, "success", "info", True
+
+    df.loc[eligible_mask, "smartlead_export_status"] = "ERR"
+    df.loc[eligible_mask, "smartlead_export_http"] = http_str
+    df.loc[eligible_mask, "smartlead_export_error"] = export_error or "Unknown error"
+    message = f"Smartlead export failed: {export_error or 'Unknown error'}"
+    return df, message, http_display, "error", "error", False
