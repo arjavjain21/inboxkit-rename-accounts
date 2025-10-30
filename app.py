@@ -4,7 +4,14 @@ from typing import List, Optional
 
 import pandas as pd
 import streamlit as st
-from utils import annotate_skip_statuses, setup_logger, parse_email, read_csv_robust
+from utils import (
+    annotate_skip_statuses,
+    apply_smartlead_export_outcome,
+    evaluate_smartlead_export,
+    parse_email,
+    read_csv_robust,
+    setup_logger,
+)
 from inboxkit_client import InboxKitClient, InboxKitError
 
 logger = setup_logger()
@@ -103,6 +110,10 @@ if "status_messages" not in st.session_state:
     st.session_state["status_messages"] = []
 if "smartlead_export_done" not in st.session_state:
     st.session_state["smartlead_export_done"] = False
+if "smartlead_export_ready" not in st.session_state:
+    st.session_state["smartlead_export_ready"] = False
+if "smartlead_export_context" not in st.session_state:
+    st.session_state["smartlead_export_context"] = None
 
 if uploaded:
     file_bytes_raw = uploaded.getvalue()
@@ -114,6 +125,8 @@ if uploaded:
         st.session_state["update_done"] = False
         st.session_state["status_messages"] = []
         st.session_state["smartlead_export_done"] = False
+        st.session_state["smartlead_export_ready"] = False
+        st.session_state["smartlead_export_context"] = None
 
     if st.session_state["data"] is None or new_upload:
         # Need a fresh buffer per read attempt
@@ -508,292 +521,318 @@ if uploaded:
                 st.error(str(e))
                 st.stop()
 
-                data_copy = current.copy()
-                processing_index = data_copy.index[processable_mask]
+            st.session_state["smartlead_export_done"] = False
+            st.session_state["smartlead_export_ready"] = False
+            st.session_state["smartlead_export_context"] = None
 
-                data_copy.loc[processing_index, "forwarding_status"] = ""
-                data_copy.loc[processing_index, "forwarding_http"] = ""
-                data_copy.loc[processing_index, "forwarding_error"] = ""
-                data_copy.loc[processing_index, "smartlead_export_status"] = ""
-                data_copy.loc[processing_index, "smartlead_export_http"] = ""
-                data_copy.loc[processing_index, "smartlead_export_error"] = ""
+            data_copy = current.copy()
+            processing_index = data_copy.index[processable_mask]
 
-                skip_message = "Skipped: no mailbox UID provided."
-                if missing_uid_forward.any():
-                    data_copy = annotate_skip_statuses(
-                        data_copy,
-                        missing_uid_forward,
-                        skip_message,
-                        columns=("forwarding", "smartlead"),
+            data_copy.loc[processing_index, "forwarding_status"] = ""
+            data_copy.loc[processing_index, "forwarding_http"] = ""
+            data_copy.loc[processing_index, "forwarding_error"] = ""
+            data_copy.loc[processing_index, "smartlead_export_status"] = ""
+            data_copy.loc[processing_index, "smartlead_export_http"] = ""
+            data_copy.loc[processing_index, "smartlead_export_error"] = ""
+
+            skip_message = "Skipped: no mailbox UID provided."
+            if missing_uid_forward.any():
+                data_copy = annotate_skip_statuses(
+                    data_copy,
+                    missing_uid_forward,
+                    skip_message,
+                    columns=("forwarding", "smartlead"),
+                )
+
+            if missing_domain_uid.any():
+                data_copy = annotate_skip_statuses(
+                    data_copy,
+                    missing_domain_uid,
+                    "Skipped: no domain UID provided.",
+                    columns=("forwarding", "smartlead"),
+                )
+
+            if missing_forwarding_url.any():
+                data_copy = annotate_skip_statuses(
+                    data_copy,
+                    missing_forwarding_url,
+                    "Skipped: no forwarding URL provided.",
+                    columns=("forwarding", "smartlead"),
+                )
+
+            domain_groups = []
+            for domain_uid_value, group in data_copy.loc[processable_mask].groupby(
+                "domain_uid"
+            ):
+                domain_uid_str = str(domain_uid_value).strip()
+                if not domain_uid_str:
+                    continue
+                domain_groups.append((domain_uid_str, group))
+
+            if not domain_groups:
+                st.info("No domains available for forwarding updates.")
+                st.session_state["data"] = data_copy
+                show_preview(
+                    preview_placeholder, "Preview after forwarding updates"
+                )
+                if skipped_forwarding_rows:
+                    st.session_state["status_messages"].append(
+                        f"Forwarding skipped: no eligible rows. Skipped {skipped_forwarding_rows} row(s)."
                     )
+            else:
+                progress = st.progress(0, text="Starting forwarding updates...")
+                total_domains = len(domain_groups)
+                success_count = 0
+                failure_count = 0
+                error_messages: List[str] = []
 
-                if missing_domain_uid.any():
-                    data_copy = annotate_skip_statuses(
-                        data_copy,
-                        missing_domain_uid,
-                        "Skipped: no domain UID provided.",
-                        columns=("forwarding", "smartlead"),
-                    )
-
-                if missing_forwarding_url.any():
-                    data_copy = annotate_skip_statuses(
-                        data_copy,
-                        missing_forwarding_url,
-                        "Skipped: no forwarding URL provided.",
-                        columns=("forwarding", "smartlead"),
-                    )
-
-                domain_groups = []
-                for domain_uid_value, group in data_copy.loc[processable_mask].groupby(
-                    "domain_uid"
-                ):
-                    domain_uid_str = str(domain_uid_value).strip()
-                    if not domain_uid_str:
-                        continue
-                    domain_groups.append((domain_uid_str, group))
-
-                if not domain_groups:
-                    st.info("No domains available for forwarding updates.")
-                    st.session_state["smartlead_export_done"] = False
-                    st.session_state["data"] = data_copy
-                    show_preview(
-                        preview_placeholder, "Preview after forwarding updates"
-                    )
-                    if skipped_forwarding_rows:
-                        st.session_state["status_messages"].append(
-                            f"Forwarding skipped: no eligible rows. Skipped {skipped_forwarding_rows} row(s)."
-                        )
-                else:
-                    progress = st.progress(0, text="Starting forwarding updates...")
-                    total_domains = len(domain_groups)
-                    success_count = 0
-                    failure_count = 0
-                    error_messages: List[str] = []
-
-                    for i, (domain_uid_value, group) in enumerate(domain_groups, start=1):
-                        domain_values = (
-                            group.get("domain", pd.Series(dtype=str))
-                            .fillna("")
-                            .astype(str)
-                            .str.strip()
-                        )
-                        domain_name = next(
-                            (d for d in domain_values if d), domain_uid_value
-                        )
-
-                        forwarding_values = (
-                            group["forwarding_url"].fillna("").astype(str).str.strip()
-                        )
-                        unique_forwarding = sorted({v for v in forwarding_values if v})
-
-                        progress.progress(
-                            min(i / total_domains, 1.0),
-                            text=f"Updating forwarding... {i}/{total_domains}",
-                        )
-
-                        if not unique_forwarding:
-                            message = (
-                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): no forwarding URL provided"
-                            )
-                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                            data_copy.loc[group.index, "forwarding_error"] = message
-                            failure_count += 1
-                            error_messages.append(message)
-                            logger.error(message)
-                            continue
-
-                        if len(unique_forwarding) > 1:
-                            joined_urls = ", ".join(unique_forwarding)
-                            message = (
-                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
-                                f"multiple forwarding URLs found ({joined_urls})"
-                            )
-                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                            data_copy.loc[group.index, "forwarding_error"] = message
-                            failure_count += 1
-                            error_messages.append(message)
-                            logger.error(message)
-                            continue
-
-                        uid_values = (
-                            group["uid"].fillna("").astype(str).str.strip()
-                            if "uid" in group
-                            else pd.Series(dtype=str)
-                        )
-                        unique_mailbox_uids = sorted({uid for uid in uid_values if uid})
-
-                        if not unique_mailbox_uids:
-                            message = (
-                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
-                                "no mailbox UIDs available"
-                            )
-                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                            data_copy.loc[group.index, "forwarding_error"] = message
-                            failure_count += 1
-                            error_messages.append(message)
-                            logger.error(message)
-                            continue
-
-                        combined_uids = [domain_uid_value]
-                        combined_uids.extend(
-                            uid
-                            for uid in unique_mailbox_uids
-                            if uid and uid not in combined_uids
-                        )
-
-                        payload = {
-                            "forwarding_url": unique_forwarding[0],
-                            "uids": combined_uids,
-                        }
-                        success, err, code = client.update_domain_forwarding(
-                            domain_uid_value, payload
-                        )
-                        http_str = str(code) if code is not None else ""
-                        http_display = http_str or "n/a"
-
-                        if success:
-                            data_copy.loc[group.index, "forwarding_status"] = "OK"
-                            data_copy.loc[group.index, "forwarding_http"] = http_str
-                            summary = (
-                                f"Forwarding updated for {domain_name} ({domain_uid_value})"
-                            )
-                            logger.info(
-                                f"{summary}: {payload['forwarding_url']} (HTTP {http_display})"
-                            )
-                            success_count += 1
-                        else:
-                            error_detail = err or "Unknown error"
-                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                            data_copy.loc[group.index, "forwarding_http"] = http_str
-                            data_copy.loc[group.index, "forwarding_error"] = error_detail
-                            failure_count += 1
-                            message = (
-                                f"Forwarding failed for {domain_name} ({domain_uid_value}): {error_detail}"
-                            )
-                            error_messages.append(f"{message} (HTTP {http_display})")
-                            logger.error(f"{message} (HTTP {http_display})")
-
-                    progress.progress(1.0, text="Forwarding updates finished.")
-
-                    summary_message = (
-                        f"Forwarding update complete. Domains success {success_count}, failed {failure_count}."
-                    )
-                    if skipped_forwarding_rows:
-                        summary_message += (
-                            f" Skipped {skipped_forwarding_rows} row(s) with incomplete data."
-                        )
-                    logger.info(summary_message)
-                    if failure_count:
-                        st.warning(summary_message)
-                    else:
-                        st.success(summary_message)
-
-                    st.session_state["status_messages"].append(summary_message)
-                    for msg in error_messages:
-                        st.session_state["status_messages"].append(msg)
-
-                    if error_messages:
-                        st.error(
-                            "Forwarding errors encountered:\n- "
-                            + "\n- ".join(error_messages)
-                        )
-
-                    mailbox_uids_series = (
-                        data_copy.loc[processable_mask, "uid"]
+                for i, (domain_uid_value, group) in enumerate(domain_groups, start=1):
+                    domain_values = (
+                        group.get("domain", pd.Series(dtype=str))
                         .fillna("")
                         .astype(str)
                         .str.strip()
-                        if "uid" in data_copy.columns
+                    )
+                    domain_name = next((d for d in domain_values if d), domain_uid_value)
+
+                    forwarding_values = (
+                        group["forwarding_url"].fillna("").astype(str).str.strip()
+                    )
+                    unique_forwarding = sorted({v for v in forwarding_values if v})
+
+                    progress.progress(
+                        min(i / total_domains, 1.0),
+                        text=f"Updating forwarding... {i}/{total_domains}",
+                    )
+
+                    if not unique_forwarding:
+                        message = (
+                            f"Forwarding skipped for {domain_name} ({domain_uid_value}): no forwarding URL provided"
+                        )
+                        data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                        data_copy.loc[group.index, "forwarding_error"] = message
+                        failure_count += 1
+                        error_messages.append(message)
+                        logger.error(message)
+                        continue
+
+                    if len(unique_forwarding) > 1:
+                        joined_urls = ", ".join(unique_forwarding)
+                        message = (
+                            f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
+                            f"multiple forwarding URLs found ({joined_urls})"
+                        )
+                        data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                        data_copy.loc[group.index, "forwarding_error"] = message
+                        failure_count += 1
+                        error_messages.append(message)
+                        logger.error(message)
+                        continue
+
+                    uid_values = (
+                        group["uid"].fillna("").astype(str).str.strip()
+                        if "uid" in group
                         else pd.Series(dtype=str)
                     )
+                    unique_mailbox_uids = sorted({uid for uid in uid_values if uid})
 
-                    forwarding_success = failure_count == 0
-                    update_status_series = data_copy.get("update_status")
-                    updates_ok = bool(st.session_state.get("update_done"))
-                    if isinstance(update_status_series, pd.Series):
-                        updates_ok = (
-                            updates_ok
-                            and not update_status_series.fillna("")
-                            .astype(str)
-                            .str.upper()
-                            .eq("ERR")
-                            .any()
+                    if not unique_mailbox_uids:
+                        message = (
+                            f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
+                            "no mailbox UIDs available"
                         )
+                        data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                        data_copy.loc[group.index, "forwarding_error"] = message
+                        failure_count += 1
+                        error_messages.append(message)
+                        logger.error(message)
+                        continue
 
-                    export_status_message: Optional[str] = None
-                    export_http_display = "n/a"
+                    combined_uids = [domain_uid_value]
+                    combined_uids.extend(
+                        uid for uid in unique_mailbox_uids if uid and uid not in combined_uids
+                    )
 
-                    eligible_uids = [
-                        uid
-                        for uid in dict.fromkeys(mailbox_uids_series.tolist())
-                        if uid
-                    ]
+                    payload = {
+                        "forwarding_url": unique_forwarding[0],
+                        "uids": combined_uids,
+                    }
+                    success, err, code = client.update_domain_forwarding(
+                        domain_uid_value, payload
+                    )
+                    http_str = str(code) if code is not None else ""
+                    http_display = http_str or "n/a"
 
-                    if forwarding_success and updates_ok and eligible_uids:
-                        export_success, export_error, export_code = (
-                            client.export_inboxes_to_smartlead(eligible_uids)
+                    if success:
+                        data_copy.loc[group.index, "forwarding_status"] = "OK"
+                        data_copy.loc[group.index, "forwarding_http"] = http_str
+                        summary = (
+                            f"Forwarding updated for {domain_name} ({domain_uid_value})"
                         )
-                        http_str = str(export_code) if export_code is not None else ""
-                        export_http_display = http_str or "n/a"
-                        eligible_mask = mailbox_uids_series.isin(eligible_uids)
-                        if export_success:
-                            data_copy.loc[eligible_mask, "smartlead_export_status"] = "OK"
-                            data_copy.loc[eligible_mask, "smartlead_export_http"] = http_str
-                            data_copy.loc[eligible_mask, "smartlead_export_error"] = ""
-                            export_status_message = (
-                                f"Smartlead export triggered for {len(eligible_uids)} mailbox(es)."
-                            )
-                            logger.info(
-                                f"{export_status_message} (HTTP {export_http_display})"
-                            )
-                            st.success(
-                                f"{export_status_message} HTTP {export_http_display}"
-                            )
-                            st.session_state["smartlead_export_done"] = True
-                        else:
-                            data_copy.loc[eligible_mask, "smartlead_export_status"] = "ERR"
-                            data_copy.loc[eligible_mask, "smartlead_export_http"] = http_str
-                            data_copy.loc[eligible_mask, "smartlead_export_error"] = (
-                                export_error or "Unknown error"
-                            )
-                            export_status_message = (
-                                f"Smartlead export failed: {export_error or 'Unknown error'}"
-                            )
-                            logger.error(
-                                f"{export_status_message} (HTTP {export_http_display})"
-                            )
-                            st.error(
-                                f"{export_status_message} (HTTP {export_http_display})"
-                            )
-                            st.session_state["smartlead_export_done"] = False
-                    elif forwarding_success and updates_ok and not eligible_uids:
-                        export_status_message = (
-                            "Smartlead export skipped: no mailbox UIDs available."
+                        logger.info(
+                            f"{summary}: {payload['forwarding_url']} (HTTP {http_display})"
                         )
+                        success_count += 1
+                    else:
+                        error_detail = err or "Unknown error"
+                        data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                        data_copy.loc[group.index, "forwarding_http"] = http_str
+                        data_copy.loc[group.index, "forwarding_error"] = error_detail
+                        failure_count += 1
+                        message = (
+                            f"Forwarding failed for {domain_name} ({domain_uid_value}): {error_detail}"
+                        )
+                        error_messages.append(f"{message} (HTTP {http_display})")
+                        logger.error(f"{message} (HTTP {http_display})")
+
+                progress.progress(1.0, text="Forwarding updates finished.")
+
+                summary_message = (
+                    f"Forwarding update complete. Domains success {success_count}, failed {failure_count}."
+                )
+                if skipped_forwarding_rows:
+                    summary_message += (
+                        f" Skipped {skipped_forwarding_rows} row(s) with incomplete data."
+                    )
+                logger.info(summary_message)
+                if failure_count:
+                    st.warning(summary_message)
+                else:
+                    st.success(summary_message)
+
+                st.session_state["status_messages"].append(summary_message)
+                for msg in error_messages:
+                    st.session_state["status_messages"].append(msg)
+
+                if error_messages:
+                    st.error(
+                        "Forwarding errors encountered:\n- "
+                        + "\n- ".join(error_messages)
+                    )
+
+                mailbox_uids_series = (
+                    data_copy.loc[processable_mask, "uid"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    if "uid" in data_copy.columns
+                    else pd.Series(dtype=str)
+                )
+
+                forwarding_success = failure_count == 0
+                update_status_series = data_copy.get("update_status")
+                updates_ok = bool(st.session_state.get("update_done"))
+                if isinstance(update_status_series, pd.Series):
+                    updates_ok = (
+                        updates_ok
+                        and not update_status_series.fillna("")
+                        .astype(str)
+                        .str.upper()
+                        .eq("ERR")
+                        .any()
+                    )
+
+                eligible_uids, export_ready, export_status_message, export_level = (
+                    evaluate_smartlead_export(
+                        forwarding_success,
+                        updates_ok,
+                        mailbox_uids_series.tolist(),
+                    )
+                )
+
+                st.session_state["smartlead_export_done"] = False
+                st.session_state["smartlead_export_ready"] = export_ready
+                st.session_state["smartlead_export_context"] = (
+                    {"eligible_uids": eligible_uids} if export_ready else None
+                )
+
+                if export_status_message:
+                    if export_ready:
                         logger.info(export_status_message)
                         st.info(export_status_message)
-                        st.session_state["smartlead_export_done"] = False
                     else:
-                        if not forwarding_success:
-                            export_status_message = (
-                                "Smartlead export skipped due to forwarding errors."
-                            )
-                        elif not updates_ok:
-                            export_status_message = (
-                                "Smartlead export skipped due to mailbox update errors."
-                            )
-                        if export_status_message:
+                        if export_level == "warning":
                             logger.warning(export_status_message)
-                            st.info(export_status_message)
-                        st.session_state["smartlead_export_done"] = False
+                        else:
+                            logger.info(export_status_message)
+                        st.info(export_status_message)
+                    st.session_state["status_messages"].append(export_status_message)
 
-                    if export_status_message:
-                        st.session_state["status_messages"].append(export_status_message)
+                st.session_state["data"] = data_copy
+                show_preview(
+                    preview_placeholder, "Preview after forwarding updates"
+                )
 
-                    st.session_state["data"] = data_copy
-                    show_preview(
-                        preview_placeholder, "Preview after forwarding updates"
+        export_context = st.session_state.get("smartlead_export_context") or {}
+        eligible_context_uids = export_context.get("eligible_uids") or []
+        if st.session_state.get("smartlead_export_ready") and eligible_context_uids:
+            if st.button("Export Inboxes", key="export_inboxes_button"):
+                try:
+                    client = InboxKitClient(
+                        base_url=base_url,
+                        bearer=bearer,
+                        workspace_id=workspace_id,
+                        uid_lookup_mode=uid_lookup_mode,
                     )
+                except InboxKitError as e:
+                    st.error(str(e))
+                    st.stop()
+
+                current_data = st.session_state["data"].copy()
+                mailbox_uids_series = (
+                    current_data["uid"].fillna("").astype(str).str.strip()
+                    if "uid" in current_data.columns
+                    else pd.Series(dtype=str)
+                )
+                eligible_mask = mailbox_uids_series.isin(eligible_context_uids)
+
+                export_success, export_error, export_code = (
+                    client.export_inboxes_to_smartlead(eligible_context_uids)
+                )
+
+                (
+                    updated_df,
+                    export_status_message,
+                    export_http_display,
+                    severity,
+                    log_level,
+                    export_done,
+                ) = apply_smartlead_export_outcome(
+                    current_data,
+                    eligible_mask,
+                    eligible_context_uids,
+                    export_success,
+                    export_error,
+                    export_code,
+                )
+
+                log_message = (
+                    f"{export_status_message} (HTTP {export_http_display})"
+                )
+                if log_level == "error":
+                    logger.error(log_message)
+                else:
+                    logger.info(log_message)
+
+                if severity == "success":
+                    st.success(f"{export_status_message} HTTP {export_http_display}")
+                else:
+                    st.error(f"{export_status_message} (HTTP {export_http_display})")
+
+                st.session_state["data"] = updated_df
+                st.session_state["status_messages"].append(export_status_message)
+                st.session_state["smartlead_export_done"] = export_done
+
+                if export_done:
+                    st.session_state["smartlead_export_ready"] = False
+                    st.session_state["smartlead_export_context"] = None
+                else:
+                    st.session_state["smartlead_export_ready"] = True
+                    st.session_state["smartlead_export_context"] = export_context
+
+                show_preview(
+                    preview_placeholder, "Preview after forwarding updates"
+                )
 
         if st.session_state["update_done"]:
             ordered_cols = _ordered_columns(st.session_state["data"])
