@@ -648,14 +648,8 @@ if uploaded:
                         logger.error(message)
                         continue
 
-                    combined_uids = [domain_uid_value]
-                    combined_uids.extend(
-                        uid for uid in unique_mailbox_uids if uid and uid not in combined_uids
-                    )
-
                     payload = {
                         "forwarding_url": unique_forwarding[0],
-                        "uids": combined_uids,
                     }
                     success, err, code = client.update_domain_forwarding(
                         domain_uid_value, payload

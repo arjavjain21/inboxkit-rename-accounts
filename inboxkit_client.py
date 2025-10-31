@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple, List, Sequence
+from typing import Any, Dict, Optional, Tuple, List, Sequence, Iterable
 import os
 import requests
 import logging
@@ -268,42 +268,32 @@ class InboxKitClient:
         if not isinstance(forwarding, dict):
             return False, "Forwarding payload must be a dictionary", None
 
-        # Normalise domain UID(s) into a list of non-empty strings.
+        # Normalise domain UID(s) into a list of unique, non-empty strings.
+        domain_uid_values: List[str] = []
+        domain_uid_iterable: Iterable[Any]
         if isinstance(domain_uid, (list, tuple, set)):
-            domain_uid_values = [str(uid).strip() for uid in domain_uid if str(uid).strip()]
+            domain_uid_iterable = domain_uid
         else:
-            domain_uid_values = [str(domain_uid).strip()] if domain_uid is not None else []
+            domain_uid_iterable = (domain_uid,) if domain_uid is not None else tuple()
+
+        for raw in domain_uid_iterable:
+            value = "" if raw is None else str(raw).strip()
+            if value and value not in domain_uid_values:
+                domain_uid_values.append(value)
 
         if not domain_uid_values:
             return False, "Domain UID is required", None
 
         forwarding_copy: Dict[str, Any] = dict(forwarding)
         forwarding_copy.pop("domain_uid", None)
-
-        raw_uids = forwarding_copy.get("uids")
-        cleaned_forwarding_uids: List[str] = []
-        if raw_uids is None:
-            cleaned_forwarding_uids = []
-        elif isinstance(raw_uids, list):
-            cleaned_forwarding_uids = [str(uid).strip() for uid in raw_uids if str(uid).strip()]
-        else:
-            return False, "UIDs must be provided as a list when supplied", None
-
-        # Merge domain UID(s) first to guarantee their presence, then any caller-supplied UIDs.
-        merged_uids: List[str] = []
-        for uid in domain_uid_values + cleaned_forwarding_uids:
-            if uid and uid not in merged_uids:
-                merged_uids.append(uid)
-
-        if not merged_uids:
-            return False, "At least one UID is required", None
+        forwarding_copy.pop("uids", None)
 
         forwarding_url = str(forwarding_copy.get("forwarding_url", "")).strip()
         if not forwarding_url:
             return False, "Forwarding URL is required", None
 
         forwarding_copy["forwarding_url"] = forwarding_url
-        forwarding_copy["uids"] = merged_uids
+        forwarding_copy["uids"] = domain_uid_values
 
         try:
             resp = self._request("POST", "/v1/api/domains/forwarding", json=forwarding_copy)
