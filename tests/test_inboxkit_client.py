@@ -82,3 +82,55 @@ def test_export_inboxes_handles_network_error(client):
     assert success is False
     assert "Network error" in error
     assert code is None
+
+
+def test_find_uid_by_email_pagination_miss(client):
+    """Mailbox lookup fails when the paginated list omits the target mailbox."""
+
+    list_payload = {
+        "mailboxes": [
+            {
+                "username": "other",
+                "domain_name": "example.com",
+                "uid": "uid-other",
+            }
+        ]
+    }
+
+    responses = iter(
+        [
+            DummyResponse(404),  # /find 404
+            DummyResponse(404),  # /search 404
+            DummyResponse(200, list_payload),  # /list returns the wrong mailbox because limit=1
+        ]
+    )
+
+    def fake_request(method, path, **kwargs):
+        return next(responses)
+
+    with mock.patch.object(client, "_request", side_effect=fake_request):
+        uid, err, code = client.find_uid_by_email(
+            "target@example.com", "target", "example.com"
+        )
+
+    assert uid is None
+    assert "No mailbox matching target@example.com" in err
+    assert code is None
+
+
+def test_find_uid_in_mailboxes_requires_domain_name_key(client):
+    """The helper ignores entries that expose `domain` instead of `domain_name`."""
+
+    payload = {
+        "mailboxes": [
+            {
+                "username": "target",
+                "domain": "example.com",
+                "uid": "uid-123",
+            }
+        ]
+    }
+
+    uid = client._find_uid_in_mailboxes(payload, "target", "example.com")
+
+    assert uid is None
