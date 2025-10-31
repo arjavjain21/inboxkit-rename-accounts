@@ -84,6 +84,44 @@ def test_export_inboxes_handles_network_error(client):
     assert code is None
 
 
+def test_update_domain_forwarding_only_sends_domain_uids(client):
+    response = DummyResponse(200, {"status": "ok"})
+    with mock.patch.object(client, "_request", return_value=response) as mocked_request:
+        success, error, code = client.update_domain_forwarding(
+            "domain-uid",
+            {
+                "forwarding_url": "https://forward.example.com",
+                "uids": ["mailbox-1", "mailbox-2"],
+            },
+        )
+
+    assert success is True
+    assert error is None
+    assert code == 200
+    mocked_request.assert_called_once()
+    called_args, called_kwargs = mocked_request.call_args
+    assert called_args == ("POST", "/v1/api/domains/forwarding")
+    payload = called_kwargs["json"]
+    assert payload["forwarding_url"] == "https://forward.example.com"
+    assert payload["uids"] == ["domain-uid"]
+
+
+def test_update_domain_forwarding_deduplicates_domains(client):
+    response = DummyResponse(200, {"status": "ok"})
+    with mock.patch.object(client, "_request", return_value=response) as mocked_request:
+        success, error, code = client.update_domain_forwarding(
+            ["domain-uid", "domain-uid  ", "another", None],
+            {"forwarding_url": "https://forward.example.com"},
+        )
+
+    assert success is True
+    assert error is None
+    assert code == 200
+    mocked_request.assert_called_once()
+    payload = mocked_request.call_args[1]["json"]
+    assert payload["uids"] == ["domain-uid", "another"]
+
+
 def test_find_uid_by_email_pagination_miss(client):
     """Mailbox lookup fails when the paginated list omits the target mailbox."""
 
