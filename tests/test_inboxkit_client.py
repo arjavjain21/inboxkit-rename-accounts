@@ -156,8 +156,8 @@ def test_find_uid_by_email_pagination_miss(client):
     assert code is None
 
 
-def test_find_uid_in_mailboxes_requires_domain_name_key(client):
-    """The helper ignores entries that expose `domain` instead of `domain_name`."""
+def test_find_uid_in_mailboxes_accepts_domain_alias(client):
+    """The helper recognises alternative domain keys when matching mailboxes."""
 
     payload = {
         "mailboxes": [
@@ -165,10 +165,75 @@ def test_find_uid_in_mailboxes_requires_domain_name_key(client):
                 "username": "target",
                 "domain": "example.com",
                 "uid": "uid-123",
-            }
+            },
+            {
+                "username": "target",
+                "domainName": "example.com",
+                "uid": "uid-456",
+            },
         ]
     }
 
     uid = client._find_uid_in_mailboxes(payload, "target", "example.com")
 
-    assert uid is None
+    assert uid == "uid-123"
+
+
+def test_find_uid_by_email_pagination_hits_additional_pages(client):
+    """Mailbox lookup iterates through paginated responses until the target appears."""
+
+    def fake_request(method, path, **kwargs):
+        if path == "/v1/api/mailboxes/find":
+            return DummyResponse(404)
+        if path == "/v1/api/mailboxes/search":
+            return DummyResponse(404)
+        if path == "/v1/api/mailboxes/list":
+            page = kwargs["json"]["page"]
+            if page == 1:
+                return DummyResponse(
+                    200,
+                    {
+                        "mailboxes": [
+                            {
+                                "username": "other",
+                                "domain_name": "example.com",
+                                "uid": "uid-other",
+                            }
+                        ],
+                        "pagination": {"page": 1, "total_pages": 2},
+                    },
+                )
+            if page == 2:
+                return DummyResponse(
+                    200,
+                    {
+                        "mailboxes": [
+                            {
+                                "username": "target",
+                                "domain": "example.com",
+                                "uid": "uid-target",
+                            }
+                        ],
+                        "pagination": {"page": 2, "total_pages": 2},
+                    },
+                )
+            return DummyResponse(404)
+        raise AssertionError(f"Unexpected path: {path}")
+
+    recorded_payloads = []
+
+    def tracking_request(method, path, **kwargs):
+        if path == "/v1/api/mailboxes/list":
+            recorded_payloads.append(kwargs["json"])
+        return fake_request(method, path, **kwargs)
+
+    with mock.patch.object(client, "_request", side_effect=tracking_request):
+        uid, err, code = client.find_uid_by_email("target@example.com", "target", "example.com")
+
+    assert uid == "uid-target"
+    assert err is None
+    assert code == 200
+    assert recorded_payloads == [
+        {"page": 1, "limit": 100, "keyword": "target", "domain": "example.com"},
+        {"page": 2, "limit": 100, "keyword": "target", "domain": "example.com"},
+    ]

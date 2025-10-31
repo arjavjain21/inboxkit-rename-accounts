@@ -65,11 +65,7 @@ class InboxKitClient:
                     return found
         return None
 
-    def _find_uid_in_mailboxes(self, data: Any, username: str, domain: str) -> Optional[str]:
-        """Attempt to locate the UID for the given username/domain within a mailboxes array."""
-        target_username = (username or "").strip().lower()
-        target_domain = (domain or "").strip().lower()
-
+    def _extract_mailboxes(self, data: Any) -> List[Dict[str, Any]]:
         def locate_mailboxes(payload: Any) -> Optional[List[Dict[str, Any]]]:
             if payload is None:
                 return None
@@ -90,17 +86,71 @@ class InboxKitClient:
 
         mailboxes = locate_mailboxes(data)
         if not mailboxes:
+            return []
+        return [entry for entry in mailboxes if isinstance(entry, dict)]
+
+    def _find_uid_in_mailboxes(self, data: Any, username: str, domain: str) -> Optional[str]:
+        """Attempt to locate the UID for the given username/domain within a mailboxes array."""
+        target_username = (username or "").strip().lower()
+        target_domain = (domain or "").strip().lower()
+
+        mailboxes = self._extract_mailboxes(data)
+        if not mailboxes:
             return None
 
+        domain_keys: Sequence[str] = ("domain_name", "domain", "domainName")
+
         for mailbox in mailboxes:
-            if not isinstance(mailbox, dict):
-                continue
             entry_username = str(mailbox.get("username", "")).strip().lower()
-            entry_domain = str(mailbox.get("domain_name", "")).strip().lower()
+            entry_domain = ""
+            for key in domain_keys:
+                value = mailbox.get(key)
+                if isinstance(value, str) and value.strip():
+                    entry_domain = value.strip().lower()
+                    break
             if entry_username == target_username and entry_domain == target_domain:
                 uid = mailbox.get("uid")
                 if isinstance(uid, str) and uid:
                     return uid
+        return None
+
+    def _determine_next_page(
+        self,
+        current_page: int,
+        payload: Any,
+        mailboxes: Sequence[Dict[str, Any]],
+        limit: int,
+    ) -> Optional[int]:
+        def extract_int(value: Any) -> Optional[int]:
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+            return None
+
+        pagination = payload.get("pagination") if isinstance(payload, dict) else None
+        if isinstance(pagination, dict):
+            next_page = extract_int(pagination.get("next_page") or pagination.get("next"))
+            if next_page and next_page > current_page:
+                return next_page
+            has_more = pagination.get("has_more") or pagination.get("has_next")
+            if has_more:
+                return current_page + 1
+            total_pages = extract_int(pagination.get("total_pages") or pagination.get("pages"))
+            current = extract_int(pagination.get("page") or pagination.get("current_page"))
+            if total_pages and current and total_pages > current:
+                return current + 1
+
+        if isinstance(payload, dict):
+            direct_next = extract_int(payload.get("next_page"))
+            if direct_next and direct_next > current_page:
+                return direct_next
+            if payload.get("has_more") is True:
+                return current_page + 1
+
+        if mailboxes and len(mailboxes) >= limit:
+            return current_page + 1
+
         return None
 
     def _find_domain_uid(self, data: Any, domain: str) -> Optional[str]:
@@ -165,8 +215,40 @@ class InboxKitClient:
                     # Hypothetical search endpoint
                     resp = self._request("GET", "/v1/api/mailboxes/search", params={"keyword": username, "domain": domain})
                 elif mode == "list":
-                    payload = {"page": 1, "limit": 1, "keyword": username, "domain": domain}
-                    resp = self._request("POST", "/v1/api/mailboxes/list", json=payload)
+                    page = 1
+                    limit = 100
+                    last_status = None
+                    while True:
+                        payload = {"page": page, "limit": limit, "keyword": username, "domain": domain}
+                        resp = self._request("POST", "/v1/api/mailboxes/list", json=payload)
+                        last_status = resp.status_code
+
+                        if resp.status_code == 401:
+                            return None, "Unauthorized. Check Bearer token.", resp.status_code
+                        if resp.status_code == 404:
+                            break
+                        if resp.status_code >= 400:
+                            tried.append((mode, f"HTTP {resp.status_code}: {resp.text[:200]}", resp.status_code))
+                            break
+
+                        data = None
+                        try:
+                            data = resp.json()
+                        except Exception:
+                            return None, "Invalid JSON from UID lookup", resp.status_code
+
+                        matched_uid = self._find_uid_in_mailboxes(data, username, domain)
+                        if matched_uid:
+                            return matched_uid, None, resp.status_code
+
+                        mailboxes = self._extract_mailboxes(data)
+                        next_page = self._determine_next_page(page, data, mailboxes, limit)
+                        if not next_page or next_page <= page:
+                            break
+                        page = next_page
+
+                    tried.append((mode, f"No mailbox matching {email} in list response", last_status))
+                    continue
                 else:
                     return None, f"Invalid UID lookup mode: {mode}", None
 
@@ -184,12 +266,6 @@ class InboxKitClient:
                     data = resp.json()
                 except Exception:
                     return None, "Invalid JSON from UID lookup", resp.status_code
-                if mode == "list":
-                    matched_uid = self._find_uid_in_mailboxes(data, username, domain)
-                    if matched_uid:
-                        return matched_uid, None, resp.status_code
-                    tried.append((mode, f"No mailbox matching {email} in list response", resp.status_code))
-                    continue
 
                 uid = self._extract_uid(data)
                 if uid:
