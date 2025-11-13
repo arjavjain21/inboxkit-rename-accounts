@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from inboxkit_client import InboxKitClient
+from inboxkit_client import InboxKitClient, InboxKitError
 
 
 class DummyResponse:
@@ -30,6 +30,20 @@ def client():
         workspace_id="workspace",
         uid_lookup_mode="auto",
     )
+
+
+def test_mailbox_list_limit_default(client):
+    assert client.mailbox_list_limit == 100000
+
+
+def test_mailbox_list_limit_validation_error():
+    with pytest.raises(InboxKitError):
+        InboxKitClient(
+            base_url="https://example.com",
+            bearer="token",
+            workspace_id="workspace",
+            mailbox_list_limit=0,
+        )
 
 
 def test_export_inboxes_success(client):
@@ -234,6 +248,6 @@ def test_find_uid_by_email_pagination_hits_additional_pages(client):
     assert err is None
     assert code == 200
     assert recorded_payloads == [
-        {"page": 1, "limit": 100, "keyword": "target", "domain": "example.com"},
-        {"page": 2, "limit": 100, "keyword": "target", "domain": "example.com"},
+        {"page": 1, "limit": 100000, "keyword": "target", "domain": "example.com"},
+        {"page": 2, "limit": 100000, "keyword": "target", "domain": "example.com"},
     ]

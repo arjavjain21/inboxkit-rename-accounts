@@ -13,12 +13,30 @@ class InboxKitClient:
     """
     SMARTLEAD_SEQUENCER_UID = "33d23a0a-e5fc-42b6-93ae-49775fac3a40"
 
-    def __init__(self, base_url: Optional[str] = None, bearer: Optional[str] = None, workspace_id: Optional[str] = None, uid_lookup_mode: Optional[str] = None):
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        bearer: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        uid_lookup_mode: Optional[str] = None,
+        mailbox_list_limit: Optional[int] = None,
+    ):
         self._logger = logging.getLogger(__name__)
         self.base_url = (base_url or os.getenv("INBOXKIT_BASE_URL") or "https://api.inboxkit.com").rstrip("/")
         self.bearer = bearer or os.getenv("INBOXKIT_BEARER")
         self.workspace_id = workspace_id or os.getenv("INBOXKIT_WORKSPACE_ID")
         self.uid_lookup_mode = (uid_lookup_mode or os.getenv("INBOXKIT_UID_LOOKUP_MODE") or "auto").lower()
+        limit_value = mailbox_list_limit
+        if limit_value is None:
+            env_limit = os.getenv("INBOXKIT_MAILBOX_LIST_LIMIT")
+            limit_value = env_limit if env_limit is not None else 100000
+        try:
+            parsed_limit = int(limit_value)
+        except (TypeError, ValueError):
+            raise InboxKitError("Mailbox list limit must be an integer between 1 and 100000")
+        if not 1 <= parsed_limit <= 100000:
+            raise InboxKitError("Mailbox list limit must be between 1 and 100000")
+        self.mailbox_list_limit = parsed_limit
         self._domain_uid_cache: Dict[str, str] = {}
         if not self.bearer or not self.workspace_id:
             raise InboxKitError("Missing credentials. Set INBOXKIT_BEARER and INBOXKIT_WORKSPACE_ID as environment variables or Streamlit secrets.")
@@ -216,7 +234,7 @@ class InboxKitClient:
                     resp = self._request("GET", "/v1/api/mailboxes/search", params={"keyword": username, "domain": domain})
                 elif mode == "list":
                     page = 1
-                    limit = 100
+                    limit = self.mailbox_list_limit
                     last_status = None
                     while True:
                         payload = {"page": page, "limit": limit, "keyword": username, "domain": domain}
