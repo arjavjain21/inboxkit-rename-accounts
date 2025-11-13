@@ -24,23 +24,6 @@ uid_lookup_mode = str(config.get("INBOXKIT_UID_LOOKUP_MODE", "auto")).strip().lo
 if uid_lookup_mode not in {"auto", "email", "search", "list"}:
     uid_lookup_mode = "auto"
 
-DEFAULT_MAILBOX_LIST_LIMIT = 100_000
-raw_list_limit = config.get("INBOXKIT_MAILBOX_LIST_LIMIT")
-mailbox_list_limit = DEFAULT_MAILBOX_LIST_LIMIT
-mailbox_list_limit_note = None
-if raw_list_limit is not None and str(raw_list_limit).strip() != "":
-    try:
-        candidate = int(str(raw_list_limit).strip())
-        if 1 <= candidate <= DEFAULT_MAILBOX_LIST_LIMIT:
-            mailbox_list_limit = candidate
-            mailbox_list_limit_note = "Using configured mailbox list limit from secrets."
-        else:
-            mailbox_list_limit_note = (
-                "Invalid secret: must be between 1 and 100000. Using default."
-            )
-    except (TypeError, ValueError):
-        mailbox_list_limit_note = "Invalid secret: must be an integer. Using default."
-
 st.set_page_config(page_title="InboxKit UID Mapper and Updater", page_icon="📧", layout="wide")
 
 st.title("📧 InboxKit UID Mapper and Updater")
@@ -99,9 +82,6 @@ with st.sidebar:
     st.text(f"Bearer Token: {masked_token}")
     st.text(f"Workspace ID: {workspace_id or 'Not set'}")
     st.text(f"UID Lookup Mode: {uid_lookup_mode}")
-    st.text(f"Mailbox List Limit: {mailbox_list_limit:,}")
-    if mailbox_list_limit_note:
-        st.caption(mailbox_list_limit_note)
 
     st.divider()
     st.subheader("Run Log")
@@ -265,13 +245,7 @@ if uploaded:
             st.stop()
 
         try:
-            client = InboxKitClient(
-                base_url=base_url,
-                bearer=bearer,
-                workspace_id=workspace_id,
-                uid_lookup_mode=uid_lookup_mode,
-                mailbox_list_limit=mailbox_list_limit,
-            )
+            client = InboxKitClient(base_url=base_url, bearer=bearer, workspace_id=workspace_id, uid_lookup_mode=uid_lookup_mode)
         except InboxKitError as e:
             st.error(str(e))
             st.stop()
@@ -457,7 +431,6 @@ if uploaded:
                         bearer=bearer,
                         workspace_id=workspace_id,
                         uid_lookup_mode=uid_lookup_mode,
-                        mailbox_list_limit=mailbox_list_limit,
                     )
                 except InboxKitError as e:
                     st.error(str(e))
@@ -543,7 +516,6 @@ if uploaded:
                     bearer=bearer,
                     workspace_id=workspace_id,
                     uid_lookup_mode=uid_lookup_mode,
-                    mailbox_list_limit=mailbox_list_limit,
                 )
             except InboxKitError as e:
                 st.error(str(e))
@@ -795,7 +767,6 @@ if uploaded:
                         bearer=bearer,
                         workspace_id=workspace_id,
                         uid_lookup_mode=uid_lookup_mode,
-                        mailbox_list_limit=mailbox_list_limit,
                     )
                 except InboxKitError as e:
                     st.error(str(e))
