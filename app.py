@@ -382,11 +382,9 @@ if uploaded:
             )
 
         unique_domains = sorted(d for d in normalized_domains.unique() if d)
-        domain_found = 0
-        domain_failed = 0
-        
+        domain_counts = {"found": 0, "failed": 0}
+
         def resolve_domain_lookups(domains: List[str], *, use_cache: bool = True):
-            nonlocal domain_found, domain_failed
             if not domains:
                 return
             with st.status("Resolving domain UIDs...", expanded=False) as domain_status:
@@ -404,7 +402,7 @@ if uploaded:
                         st.session_state["data"].loc[mask, "domain_uid"] = cached["uid"]
                         st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                         st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                        domain_found += 1
+                        domain_counts["found"] += 1
                         _log_progress("Domain lookups (cached)", i, total_domains)
                     else:
                         uid, err, code = client.get_domain_uid(domain_value)
@@ -418,13 +416,13 @@ if uploaded:
                             st.session_state["data"].loc[mask, "domain_uid"] = uid
                             st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                             st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                            domain_found += 1
+                            domain_counts["found"] += 1
                             _log_progress("Domain lookups", i, total_domains)
                         else:
                             st.session_state["data"].loc[mask, "domain_uid"] = None
                             st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
                             st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                            domain_failed += 1
+                            domain_counts["failed"] += 1
                             logger.error(
                                 f"Domain lookup failed for {domain_value}: {err or 'Lookup failed'} (HTTP {http_display})"
                             )
@@ -438,7 +436,7 @@ if uploaded:
         summary_message = (
             "UID mapping finished. "
             f"Mailboxes found {found}, failed {bad}. "
-            f"Domains resolved {domain_found}, failed {domain_failed}."
+            f"Domains resolved {domain_counts['found']}, failed {domain_counts['failed']}."
         )
         st.success(summary_message)
         logger.info(summary_message)
