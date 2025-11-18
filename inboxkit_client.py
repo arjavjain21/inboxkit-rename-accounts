@@ -287,7 +287,20 @@ class InboxKitClient:
         if user_name:
             payload["user_name"] = user_name
 
-        resp = self._request("POST", "/v1/api/mailboxes/update", json=payload)
+        try:
+            resp = self._request("POST", "/v1/api/mailboxes/update", json=payload)
+        except requests.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            message = None
+            if e.response is not None:
+                try:
+                    body = e.response.json()
+                    message = body.get("message") or body.get("error") or str(body)
+                except Exception:
+                    message = e.response.text[:200]
+            return False, f"HTTP {status_code or 'error'}: {message or str(e)}", status_code
+        except requests.RequestException as e:
+            return False, f"Network error: {str(e)}", None
         if resp.status_code == 401:
             return False, "Unauthorized. Check Bearer token.", resp.status_code
         if resp.status_code == 404:
