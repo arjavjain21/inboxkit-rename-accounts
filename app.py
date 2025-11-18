@@ -284,7 +284,7 @@ with st.sidebar:
         st.caption("No status updates yet.")
 
 st.info(
-    "Upload a CSV with at least an **email** column. Optional columns: **first_name**, **last_name**, **user_name**, forwarding settings such as **forwarding_url** or **forwarding_to**."
+    "Upload a CSV with at least an **email** column. Optional columns: **first_name**, **last_name**, **user_name**, forwarding settings such as **forwarding_url** or **forwarding_to**. For best performance, upload **250 rows or fewer** per run."
 )
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
@@ -354,6 +354,19 @@ if uploaded:
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
             st.stop()
+
+        if len(df) > 250:
+            st.warning(
+                "This tool is optimized for up to 250 rows per run. "
+                "Upload a smaller file or check the box below to truncate to the first 250 rows."
+            )
+            truncate_confirmed = st.checkbox(
+                "Truncate to the first 250 rows for processing", key=f"truncate_{token}"
+            )
+            if not truncate_confirmed:
+                st.stop()
+
+            df = df.head(250)
 
         # Normalize columns
         df.columns = [c.strip() for c in df.columns]
