@@ -514,7 +514,7 @@ if uploaded:
             edited = st.data_editor(
                 manual,
                 num_rows="dynamic",
-                use_container_width=True,
+                width="stretch",
                 key="manual_uid_editor",
                 disabled=["row_index", "email", "domain"],
             )
