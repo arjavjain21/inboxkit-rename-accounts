@@ -7,9 +7,12 @@ import streamlit as st
 from utils import (
     annotate_skip_statuses,
     apply_smartlead_export_outcome,
+    clear_persisted_session,
     evaluate_smartlead_export,
+    load_persisted_session,
     parse_email,
     read_csv_robust,
+    persist_session_state,
     setup_logger,
 )
 from inboxkit_client import InboxKitClient, InboxKitError
@@ -66,6 +69,25 @@ def _ordered_columns(df: pd.DataFrame) -> List[str]:
 def _human_yes_no(value: str) -> str:
     normalized = str(value or "").strip().upper()
     return "yes" if normalized == "OK" else "no"
+
+
+def _persist_current_session(token: Optional[str]) -> None:
+    data = st.session_state.get("data")
+    if not token or data is None:
+        return
+
+    metadata = {
+        "uid_mapped": st.session_state.get("uid_mapped", False),
+        "update_done": st.session_state.get("update_done", False),
+        "smartlead_export_ready": st.session_state.get("smartlead_export_ready", False),
+        "smartlead_export_context": st.session_state.get(
+            "smartlead_export_context"
+        ),
+        "domain_uid_cache": st.session_state.get("domain_uid_cache", {}),
+        "smartlead_export_done": st.session_state.get("smartlead_export_done", False),
+    }
+
+    persist_session_state(token, data, metadata)
 
 
 def build_final_report(df: pd.DataFrame) -> pd.DataFrame:
@@ -282,8 +304,32 @@ if "domain_uid_cache" not in st.session_state:
 if uploaded:
     file_bytes_raw = uploaded.getvalue()
     token = hashlib.md5(file_bytes_raw).hexdigest()
+
+    if st.session_state.get("upload_token") != token and st.session_state.get("data") is None:
+        restored = load_persisted_session(token)
+        if restored:
+            restored_df, restored_meta = restored
+            st.session_state["data"] = restored_df
+            st.session_state["upload_token"] = token
+            st.session_state["uid_mapped"] = restored_meta.get("uid_mapped", False)
+            st.session_state["update_done"] = restored_meta.get("update_done", False)
+            st.session_state["smartlead_export_ready"] = restored_meta.get(
+                "smartlead_export_ready", False
+            )
+            st.session_state["smartlead_export_context"] = restored_meta.get(
+                "smartlead_export_context"
+            )
+            st.session_state["smartlead_export_done"] = restored_meta.get(
+                "smartlead_export_done", False
+            )
+            st.session_state["domain_uid_cache"] = restored_meta.get(
+                "domain_uid_cache", {}
+            )
     new_upload = st.session_state.get("upload_token") != token
     if new_upload:
+        previous_token = st.session_state.get("upload_token")
+        if previous_token and previous_token != token:
+            clear_persisted_session(previous_token)
         st.session_state["upload_token"] = token
         st.session_state["uid_mapped"] = False
         st.session_state["update_done"] = False
@@ -387,6 +433,7 @@ if uploaded:
             work["forwarding_url"] = forward_series
 
         st.session_state["data"] = work
+        _persist_current_session(token)
 
     st.subheader("Preview")
     preview_placeholder = st.empty()
@@ -515,6 +562,7 @@ if uploaded:
         logger.info(summary_message)
         st.session_state["status_messages"].append(summary_message)
         st.session_state["uid_mapped"] = True
+        _persist_current_session(token)
         show_preview(preview_placeholder, "Preview after UID mapping")
 
         unresolved_mask = (
@@ -716,6 +764,7 @@ if uploaded:
                 st.session_state["status_messages"].append(summary)
                 show_preview(preview_placeholder, "Preview after updates")
                 st.session_state["update_done"] = bool(total)
+                _persist_current_session(token)
 
         st.divider()
         st.subheader("Step 3: Update Forwarding")
@@ -814,6 +863,7 @@ if uploaded:
             if not domain_groups:
                 st.info("No domains available for forwarding updates.")
                 st.session_state["data"] = data_copy
+                _persist_current_session(token)
                 show_preview(
                     preview_placeholder, "Preview after forwarding updates"
                 )
@@ -995,6 +1045,7 @@ if uploaded:
                     st.session_state["status_messages"].append(export_status_message)
 
                 st.session_state["data"] = data_copy
+                _persist_current_session(token)
                 show_preview(
                     preview_placeholder, "Preview after forwarding updates"
                 )
@@ -1066,6 +1117,7 @@ if uploaded:
                     st.session_state["smartlead_export_ready"] = True
                     st.session_state["smartlead_export_context"] = export_context
 
+                _persist_current_session(token)
                 show_preview(
                     preview_placeholder, "Preview after forwarding updates"
                 )
