@@ -14,6 +14,7 @@ from utils import (
 )
 from inboxkit_client import InboxKitClient, InboxKitError
 
+LOG_INTERVAL = 20
 logger = setup_logger()
 
 config = st.secrets
@@ -60,6 +61,95 @@ def _ordered_columns(df: pd.DataFrame) -> List[str]:
     ordered = [col for col in preferred if col in df.columns]
     ordered.extend(col for col in df.columns if col not in ordered)
     return ordered
+
+
+def _categorize_row(row: pd.Series) -> str:
+    statuses = []
+    for col in ["update_status", "forwarding_status", "smartlead_export_status"]:
+        status_val = str(row.get(col, "") or "").strip()
+        if status_val:
+            statuses.append(status_val)
+
+    if not statuses:
+        return "skipped"
+
+    normalized = [s.upper() for s in statuses]
+    if any("SKIP" in s for s in normalized):
+        return "skipped"
+    if any(s.startswith("ERR") or "FAIL" in s for s in normalized):
+        return "fail"
+    if any(s.startswith("INVALID") for s in normalized):
+        return "fail"
+    if any(s.startswith("OK") or s == "MANUAL" for s in normalized):
+        return "success"
+    return "skipped"
+
+
+def collect_run_results(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "email",
+        "uid",
+        "domain_uid",
+        "update_status",
+        "update_http",
+        "update_error",
+        "forwarding_status",
+        "forwarding_http",
+        "forwarding_error",
+        "smartlead_export_status",
+        "smartlead_export_http",
+        "smartlead_export_error",
+    ]
+
+    available_cols = [c for c in columns if c in df.columns]
+    if not available_cols:
+        return pd.DataFrame()
+
+    results = df.loc[:, available_cols].copy()
+    results["result"] = results.apply(_categorize_row, axis=1)
+    return results
+
+
+def show_results_summary(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+
+    results = collect_run_results(df)
+    if results.empty:
+        return
+
+    st.divider()
+    st.subheader("Run Results")
+
+    counts = results["result"].value_counts()
+    success_count = int(counts.get("success", 0))
+    fail_count = int(counts.get("fail", 0))
+    skipped_count = int(counts.get("skipped", 0))
+
+    metrics = st.columns(3)
+    metrics[0].metric("Success", f"{success_count}")
+    metrics[1].metric("Failed", f"{fail_count}")
+    metrics[2].metric("Skipped", f"{skipped_count}")
+
+    failed_rows = results.loc[results["result"] == "fail"]
+    if not failed_rows.empty:
+        failure_csv = failed_rows.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download failures CSV",
+            data=failure_csv,
+            file_name="failures.csv",
+            mime="text/csv",
+            key="download_failures_csv",
+        )
+        st.caption("First few failures")
+        st.dataframe(failed_rows.head(10))
+
+
+def _log_progress(label: str, current: int, total: int) -> None:
+    if total <= 0:
+        return
+    if current == 1 or current == total or current % LOG_INTERVAL == 0:
+        logger.info(f"{label}: {current}/{total}")
 
 
 def show_preview(placeholder, note: Optional[str] = None) -> None:
@@ -254,29 +344,33 @@ if uploaded:
             st.stop()
 
         total = len(st.session_state["data"])
-        progress = st.progress(0, text="Starting UID mapping...")
         found = 0
         bad = 0
-        for i, idx in enumerate(st.session_state["data"].index, start=1):
-            row = st.session_state["data"].loc[idx]
-            email = row["email"]
-            username = row["username"]
-            domain = row["domain"]
-            if not username or not domain:
-                st.session_state["data"].at[idx, "uid_status"] = "Invalid email"
-                bad += 1
-            else:
-                uid, err, code = client.find_uid_by_email(email, username, domain)
-                if uid:
-                    st.session_state["data"].at[idx, "uid"] = uid
-                    st.session_state["data"].at[idx, "uid_status"] = "OK"
-                    st.session_state["data"].at[idx, "uid_http"] = str(code or "")
-                    found += 1
-                else:
-                    st.session_state["data"].at[idx, "uid_status"] = err or "Lookup failed"
-                    st.session_state["data"].at[idx, "uid_http"] = str(code or "")
+        with st.status("Mapping UIDs...", expanded=False) as status_box:
+            progress = st.progress(0, text="Starting UID mapping...")
+            for i, idx in enumerate(st.session_state["data"].index, start=1):
+                row = st.session_state["data"].loc[idx]
+                email = row["email"]
+                username = row["username"]
+                domain = row["domain"]
+                if not username or not domain:
+                    st.session_state["data"].at[idx, "uid_status"] = "Invalid email"
                     bad += 1
-            progress.progress(i / total, text=f"Mapping UIDs... {i}/{total}")
+                else:
+                    uid, err, code = client.find_uid_by_email(email, username, domain)
+                    if uid:
+                        st.session_state["data"].at[idx, "uid"] = uid
+                        st.session_state["data"].at[idx, "uid_status"] = "OK"
+                        st.session_state["data"].at[idx, "uid_http"] = str(code or "")
+                        found += 1
+                    else:
+                        st.session_state["data"].at[idx, "uid_status"] = err or "Lookup failed"
+                        st.session_state["data"].at[idx, "uid_http"] = str(code or "")
+                        bad += 1
+
+                progress.progress(i / total, text=f"Mapping UIDs... {i}/{total}")
+                _log_progress("UID mapping", i, total)
+            status_box.update(label="UID mapping complete", state="complete")
 
         domain_series = st.session_state["data"]["domain"].fillna("").astype(str)
         normalized_domains = domain_series.str.strip().str.lower()
@@ -295,51 +389,49 @@ if uploaded:
             nonlocal domain_found, domain_failed
             if not domains:
                 return
-            domain_progress = st.progress(0, text="Resolving domains...")
-            total_domains = len(domains)
-            for i, domain_value in enumerate(domains, start=1):
-                cached = (
-                    st.session_state["domain_uid_cache"].get(domain_value)
-                    if use_cache
-                    else None
-                )
-                mask = normalized_domains == domain_value
-                if cached and cached.get("uid"):
-                    http_str = cached.get("http", "")
-                    st.session_state["data"].loc[mask, "domain_uid"] = cached["uid"]
-                    st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
-                    st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                    domain_found += 1
-                    logger.info(
-                        f"Domain lookup (cached) OK: {domain_value} -> {cached['uid']} (HTTP {http_str or 'n/a'})"
+            with st.status("Resolving domain UIDs...", expanded=False) as domain_status:
+                domain_progress = st.progress(0, text="Resolving domains...")
+                total_domains = len(domains)
+                for i, domain_value in enumerate(domains, start=1):
+                    cached = (
+                        st.session_state["domain_uid_cache"].get(domain_value)
+                        if use_cache
+                        else None
                     )
-                else:
-                    uid, err, code = client.get_domain_uid(domain_value)
-                    http_str = str(code) if code is not None else ""
-                    http_display = http_str or "n/a"
-                    if uid:
-                        st.session_state["domain_uid_cache"][domain_value] = {
-                            "uid": uid,
-                            "http": http_str,
-                        }
-                        st.session_state["data"].loc[mask, "domain_uid"] = uid
+                    mask = normalized_domains == domain_value
+                    if cached and cached.get("uid"):
+                        http_str = cached.get("http", "")
+                        st.session_state["data"].loc[mask, "domain_uid"] = cached["uid"]
                         st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                         st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
                         domain_found += 1
-                        logger.info(
-                            f"Domain lookup OK: {domain_value} -> {uid} (HTTP {http_display})"
-                        )
+                        _log_progress("Domain lookups (cached)", i, total_domains)
                     else:
-                        st.session_state["data"].loc[mask, "domain_uid"] = None
-                        st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
-                        st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                        domain_failed += 1
-                        logger.error(
-                            f"Domain lookup failed for {domain_value}: {err or 'Lookup failed'} (HTTP {http_display})"
-                        )
-                domain_progress.progress(
-                    i / total_domains, text=f"Resolving domains... {i}/{total_domains}"
-                )
+                        uid, err, code = client.get_domain_uid(domain_value)
+                        http_str = str(code) if code is not None else ""
+                        http_display = http_str or "n/a"
+                        if uid:
+                            st.session_state["domain_uid_cache"][domain_value] = {
+                                "uid": uid,
+                                "http": http_str,
+                            }
+                            st.session_state["data"].loc[mask, "domain_uid"] = uid
+                            st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
+                            st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
+                            domain_found += 1
+                            _log_progress("Domain lookups", i, total_domains)
+                        else:
+                            st.session_state["data"].loc[mask, "domain_uid"] = None
+                            st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
+                            st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
+                            domain_failed += 1
+                            logger.error(
+                                f"Domain lookup failed for {domain_value}: {err or 'Lookup failed'} (HTTP {http_display})"
+                            )
+                    domain_progress.progress(
+                        i / total_domains, text=f"Resolving domains... {i}/{total_domains}"
+                    )
+                domain_status.update(label="Domain lookups complete", state="complete")
 
         if unique_domains:
             resolve_domain_lookups(unique_domains)
@@ -504,35 +596,38 @@ if uploaded:
                     st.stop()
                 st.session_state["smartlead_export_done"] = False
                 total = len(valid_ready)
-                progress = st.progress(0, text="Starting updates...")
                 ok = 0
                 fail = 0
-                for i, idx in enumerate(valid_ready.index, start=1):
-                    row = valid_ready.loc[idx]
-                    success, err, code = client.update_mailbox(
-                        uid=row["uid"],
-                        first_name=(row.get("first_name") or "").strip() or None,
-                        last_name=(row.get("last_name") or "").strip() or None,
-                        user_name=(row.get("user_name") or "").strip() or None,
-                    )
-                    http_code = str(code or "")
-                    if success:
-                        ready.at[idx, "update_status"] = "OK"
-                        ready.at[idx, "update_http"] = http_code
-                        ready.at[idx, "update_error"] = ""
-                        ok += 1
-                    else:
-                        ready.at[idx, "update_status"] = "ERR"
-                        ready.at[idx, "update_http"] = http_code
-                        ready.at[idx, "update_error"] = err or ""
-                        logger.error(
-                            "Mailbox update failed for UID %s (email: %s): %s",
-                            row.get("uid"),
-                            row.get("email"),
-                            err or "Unknown error",
+                with st.status("Updating mailboxes...", expanded=False) as status_box:
+                    progress = st.progress(0, text="Starting updates...")
+                    for i, idx in enumerate(valid_ready.index, start=1):
+                        row = valid_ready.loc[idx]
+                        success, err, code = client.update_mailbox(
+                            uid=row["uid"],
+                            first_name=(row.get("first_name") or "").strip() or None,
+                            last_name=(row.get("last_name") or "").strip() or None,
+                            user_name=(row.get("user_name") or "").strip() or None,
                         )
-                        fail += 1
-                    progress.progress(i / total, text=f"Updating... {i}/{total}")
+                        http_code = str(code or "")
+                        if success:
+                            ready.at[idx, "update_status"] = "OK"
+                            ready.at[idx, "update_http"] = http_code
+                            ready.at[idx, "update_error"] = ""
+                            ok += 1
+                        else:
+                            ready.at[idx, "update_status"] = "ERR"
+                            ready.at[idx, "update_http"] = http_code
+                            ready.at[idx, "update_error"] = err or ""
+                            logger.error(
+                                "Mailbox update failed for UID %s (email: %s): %s",
+                                row.get("uid"),
+                                row.get("email"),
+                                err or "Unknown error",
+                            )
+                            fail += 1
+                        progress.progress(i / total, text=f"Updating... {i}/{total}")
+                        _log_progress("Mailbox updates", i, total)
+                    status_box.update(label="Mailbox updates complete", state="complete")
 
                 st.session_state["data"] = ready
                 summary = (
@@ -656,104 +751,104 @@ if uploaded:
                         f"Forwarding skipped: no eligible rows. Skipped {skipped_forwarding_rows} row(s)."
                     )
             else:
-                progress = st.progress(0, text="Starting forwarding updates...")
                 total_domains = len(domain_groups)
                 success_count = 0
                 failure_count = 0
                 error_messages: List[str] = []
 
-                for i, (domain_uid_value, group) in enumerate(domain_groups, start=1):
-                    domain_values = (
-                        group.get("domain", pd.Series(dtype=str))
-                        .fillna("")
-                        .astype(str)
-                        .str.strip()
+                with st.status("Updating forwarding...", expanded=False) as forwarding_status:
+                    progress = st.progress(0, text="Starting forwarding updates...")
+
+                    for i, (domain_uid_value, group) in enumerate(domain_groups, start=1):
+                        domain_values = (
+                            group.get("domain", pd.Series(dtype=str))
+                            .fillna("")
+                            .astype(str)
+                            .str.strip()
+                        )
+                        domain_name = next((d for d in domain_values if d), domain_uid_value)
+
+                        forwarding_values = (
+                            group["forwarding_url"].fillna("").astype(str).str.strip()
+                        )
+                        unique_forwarding = sorted({v for v in forwarding_values if v})
+
+                        progress.progress(
+                            min(i / total_domains, 1.0),
+                            text=f"Updating forwarding... {i}/{total_domains}",
+                        )
+
+                        if not unique_forwarding:
+                            message = (
+                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): no forwarding URL provided"
+                            )
+                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                            data_copy.loc[group.index, "forwarding_error"] = message
+                            failure_count += 1
+                            error_messages.append(message)
+                            logger.error(message)
+                            continue
+
+                        if len(unique_forwarding) > 1:
+                            joined_urls = ", ".join(unique_forwarding)
+                            message = (
+                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
+                                f"multiple forwarding URLs found ({joined_urls})"
+                            )
+                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                            data_copy.loc[group.index, "forwarding_error"] = message
+                            failure_count += 1
+                            error_messages.append(message)
+                            logger.error(message)
+                            continue
+
+                        uid_values = (
+                            group["uid"].fillna("").astype(str).str.strip()
+                            if "uid" in group
+                            else pd.Series(dtype=str)
+                        )
+                        unique_mailbox_uids = sorted({uid for uid in uid_values if uid})
+
+                        if not unique_mailbox_uids:
+                            message = (
+                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
+                                "no mailbox UIDs available"
+                            )
+                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                            data_copy.loc[group.index, "forwarding_error"] = message
+                            failure_count += 1
+                            error_messages.append(message)
+                            logger.error(message)
+                            continue
+
+                        payload = {
+                            "forwarding_url": unique_forwarding[0],
+                        }
+                        success, err, code = client.update_domain_forwarding(
+                            domain_uid_value, payload
+                        )
+                        http_str = str(code) if code is not None else ""
+                        http_display = http_str or "n/a"
+
+                        if success:
+                            data_copy.loc[group.index, "forwarding_status"] = "OK"
+                            data_copy.loc[group.index, "forwarding_http"] = http_str
+                            success_count += 1
+                            _log_progress("Forwarding updates", i, total_domains)
+                        else:
+                            error_detail = err or "Unknown error"
+                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                            data_copy.loc[group.index, "forwarding_http"] = http_str
+                            data_copy.loc[group.index, "forwarding_error"] = error_detail
+                            failure_count += 1
+                            message = (
+                                f"Forwarding failed for {domain_name} ({domain_uid_value}): {error_detail}"
+                            )
+                            error_messages.append(f"{message} (HTTP {http_display})")
+                            logger.error(f"{message} (HTTP {http_display})")
+                    forwarding_status.update(
+                        label="Forwarding updates complete", state="complete"
                     )
-                    domain_name = next((d for d in domain_values if d), domain_uid_value)
-
-                    forwarding_values = (
-                        group["forwarding_url"].fillna("").astype(str).str.strip()
-                    )
-                    unique_forwarding = sorted({v for v in forwarding_values if v})
-
-                    progress.progress(
-                        min(i / total_domains, 1.0),
-                        text=f"Updating forwarding... {i}/{total_domains}",
-                    )
-
-                    if not unique_forwarding:
-                        message = (
-                            f"Forwarding skipped for {domain_name} ({domain_uid_value}): no forwarding URL provided"
-                        )
-                        data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                        data_copy.loc[group.index, "forwarding_error"] = message
-                        failure_count += 1
-                        error_messages.append(message)
-                        logger.error(message)
-                        continue
-
-                    if len(unique_forwarding) > 1:
-                        joined_urls = ", ".join(unique_forwarding)
-                        message = (
-                            f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
-                            f"multiple forwarding URLs found ({joined_urls})"
-                        )
-                        data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                        data_copy.loc[group.index, "forwarding_error"] = message
-                        failure_count += 1
-                        error_messages.append(message)
-                        logger.error(message)
-                        continue
-
-                    uid_values = (
-                        group["uid"].fillna("").astype(str).str.strip()
-                        if "uid" in group
-                        else pd.Series(dtype=str)
-                    )
-                    unique_mailbox_uids = sorted({uid for uid in uid_values if uid})
-
-                    if not unique_mailbox_uids:
-                        message = (
-                            f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
-                            "no mailbox UIDs available"
-                        )
-                        data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                        data_copy.loc[group.index, "forwarding_error"] = message
-                        failure_count += 1
-                        error_messages.append(message)
-                        logger.error(message)
-                        continue
-
-                    payload = {
-                        "forwarding_url": unique_forwarding[0],
-                    }
-                    success, err, code = client.update_domain_forwarding(
-                        domain_uid_value, payload
-                    )
-                    http_str = str(code) if code is not None else ""
-                    http_display = http_str or "n/a"
-
-                    if success:
-                        data_copy.loc[group.index, "forwarding_status"] = "OK"
-                        data_copy.loc[group.index, "forwarding_http"] = http_str
-                        summary = (
-                            f"Forwarding updated for {domain_name} ({domain_uid_value})"
-                        )
-                        logger.info(
-                            f"{summary}: {payload['forwarding_url']} (HTTP {http_display})"
-                        )
-                        success_count += 1
-                    else:
-                        error_detail = err or "Unknown error"
-                        data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                        data_copy.loc[group.index, "forwarding_http"] = http_str
-                        data_copy.loc[group.index, "forwarding_error"] = error_detail
-                        failure_count += 1
-                        message = (
-                            f"Forwarding failed for {domain_name} ({domain_uid_value}): {error_detail}"
-                        )
-                        error_messages.append(f"{message} (HTTP {http_display})")
-                        logger.error(f"{message} (HTTP {http_display})")
 
                 progress.progress(1.0, text="Forwarding updates finished.")
 
@@ -916,6 +1011,8 @@ if uploaded:
                 mime="text/csv",
                 key="download_results_csv",
             )
+
+        show_results_summary(st.session_state["data"])
 
         st.divider()
         st.subheader("Status Updates")
