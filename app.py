@@ -114,6 +114,8 @@ if "smartlead_export_ready" not in st.session_state:
     st.session_state["smartlead_export_ready"] = False
 if "smartlead_export_context" not in st.session_state:
     st.session_state["smartlead_export_context"] = None
+if "domain_uid_cache" not in st.session_state:
+    st.session_state["domain_uid_cache"] = {}
 
 if uploaded:
     file_bytes_raw = uploaded.getvalue()
@@ -127,6 +129,7 @@ if uploaded:
         st.session_state["smartlead_export_done"] = False
         st.session_state["smartlead_export_ready"] = False
         st.session_state["smartlead_export_context"] = None
+        st.session_state["domain_uid_cache"] = {}
 
     if st.session_state["data"] is None or new_upload:
         # Need a fresh buffer per read attempt
@@ -287,33 +290,59 @@ if uploaded:
         unique_domains = sorted(d for d in normalized_domains.unique() if d)
         domain_found = 0
         domain_failed = 0
-        if unique_domains:
+        
+        def resolve_domain_lookups(domains: List[str], *, use_cache: bool = True):
+            nonlocal domain_found, domain_failed
+            if not domains:
+                return
             domain_progress = st.progress(0, text="Resolving domains...")
-            total_domains = len(unique_domains)
-            for i, domain_value in enumerate(unique_domains, start=1):
-                uid, err, code = client.get_domain_uid(domain_value)
+            total_domains = len(domains)
+            for i, domain_value in enumerate(domains, start=1):
+                cached = (
+                    st.session_state["domain_uid_cache"].get(domain_value)
+                    if use_cache
+                    else None
+                )
                 mask = normalized_domains == domain_value
-                http_str = str(code) if code is not None else ""
-                http_display = http_str or "n/a"
-                if uid:
-                    st.session_state["data"].loc[mask, "domain_uid"] = uid
+                if cached and cached.get("uid"):
+                    http_str = cached.get("http", "")
+                    st.session_state["data"].loc[mask, "domain_uid"] = cached["uid"]
                     st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                     st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
                     domain_found += 1
                     logger.info(
-                        f"Domain lookup OK: {domain_value} -> {uid} (HTTP {http_display})"
+                        f"Domain lookup (cached) OK: {domain_value} -> {cached['uid']} (HTTP {http_str or 'n/a'})"
                     )
                 else:
-                    st.session_state["data"].loc[mask, "domain_uid"] = None
-                    st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
-                    st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                    domain_failed += 1
-                    logger.error(
-                        f"Domain lookup failed for {domain_value}: {err or 'Lookup failed'} (HTTP {http_display})"
-                    )
+                    uid, err, code = client.get_domain_uid(domain_value)
+                    http_str = str(code) if code is not None else ""
+                    http_display = http_str or "n/a"
+                    if uid:
+                        st.session_state["domain_uid_cache"][domain_value] = {
+                            "uid": uid,
+                            "http": http_str,
+                        }
+                        st.session_state["data"].loc[mask, "domain_uid"] = uid
+                        st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
+                        st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
+                        domain_found += 1
+                        logger.info(
+                            f"Domain lookup OK: {domain_value} -> {uid} (HTTP {http_display})"
+                        )
+                    else:
+                        st.session_state["data"].loc[mask, "domain_uid"] = None
+                        st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
+                        st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
+                        domain_failed += 1
+                        logger.error(
+                            f"Domain lookup failed for {domain_value}: {err or 'Lookup failed'} (HTTP {http_display})"
+                        )
                 domain_progress.progress(
                     i / total_domains, text=f"Resolving domains... {i}/{total_domains}"
                 )
+
+        if unique_domains:
+            resolve_domain_lookups(unique_domains)
         summary_message = (
             "UID mapping finished. "
             f"Mailboxes found {found}, failed {bad}. "
@@ -324,6 +353,44 @@ if uploaded:
         st.session_state["status_messages"].append(summary_message)
         st.session_state["uid_mapped"] = True
         show_preview(preview_placeholder, "Preview after UID mapping")
+
+        unresolved_mask = (
+            (st.session_state["data"]["domain_uid_status"] != "OK")
+            & (normalized_domains != "")
+        )
+        unresolved_domains = sorted(
+            st.session_state["data"].loc[unresolved_mask, "domain"]
+            .fillna("")
+            .str.strip()
+            .str.lower()
+            .unique()
+        )
+        if unresolved_domains:
+            st.subheader("Unresolved domains")
+            unresolved_rows = []
+            for domain_value in unresolved_domains:
+                mask = normalized_domains == domain_value
+                status = (
+                    st.session_state["data"].loc[mask, "domain_uid_status"].iloc[0]
+                    if not st.session_state["data"].loc[mask].empty
+                    else ""
+                )
+                http_code = (
+                    st.session_state["data"].loc[mask, "domain_uid_http"].iloc[0]
+                    if not st.session_state["data"].loc[mask].empty
+                    else ""
+                )
+                unresolved_rows.append(
+                    {
+                        "domain": domain_value,
+                        "status": status,
+                        "http": http_code,
+                    }
+                )
+            st.dataframe(pd.DataFrame(unresolved_rows))
+            if st.button("Retry failed lookups", key="retry_failed_domains"):
+                resolve_domain_lookups(unresolved_domains, use_cache=False)
+                show_preview(preview_placeholder, "Preview after UID mapping")
 
     if st.session_state["uid_mapped"]:
         ordered_cols = _ordered_columns(st.session_state["data"])

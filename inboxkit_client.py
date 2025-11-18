@@ -327,7 +327,10 @@ class InboxKitClient:
         try:
             resp = self._request("POST", "/v1/api/domains/list", json=payload)
         except requests.RequestException as e:
-            return None, f"Network error: {str(e)}", None
+            status_code = e.response.status_code if getattr(e, "response", None) else None
+            if status_code and status_code >= 500:
+                return None, f"Server error after retries (HTTP {status_code})", status_code
+            return None, f"Network error: {str(e)}", status_code
 
         if resp.status_code == 401:
             return None, "Unauthorized. Check Bearer token.", resp.status_code
