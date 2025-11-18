@@ -63,6 +63,78 @@ def _ordered_columns(df: pd.DataFrame) -> List[str]:
     return ordered
 
 
+def _human_yes_no(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    return "yes" if normalized == "OK" else "no"
+
+
+def build_final_report(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    report = pd.DataFrame()
+    report["input_email"] = df.get("input_email", df.get("email", pd.Series(dtype=str)))
+    report["new_email"] = df.get("email", pd.Series(dtype=str))
+    report["uid"] = df.get("uid", pd.Series(dtype=str))
+    report["domain_uid"] = df.get("domain_uid", pd.Series(dtype=str))
+    report["forwarding_url"] = df.get("forwarding_url", pd.Series(dtype=str))
+    report["update_status"] = df.get("update_status", pd.Series(dtype=str))
+    report["update_http"] = df.get("update_http", pd.Series(dtype=str))
+    report["update_error"] = df.get("update_error", pd.Series(dtype=str))
+    report["forwarding_status"] = df.get("forwarding_status", pd.Series(dtype=str))
+    report["forwarding_http"] = df.get("forwarding_http", pd.Series(dtype=str))
+    report["forwarding_error"] = df.get("forwarding_error", pd.Series(dtype=str))
+    report["smartlead_export_status"] = df.get(
+        "smartlead_export_status", pd.Series(dtype=str)
+    )
+    report["smartlead_export_http"] = df.get(
+        "smartlead_export_http", pd.Series(dtype=str)
+    )
+    report["smartlead_export_error"] = df.get(
+        "smartlead_export_error", pd.Series(dtype=str)
+    )
+
+    def _summarize(row: pd.Series) -> str:
+        parts = []
+        upd_status = str(row.get("update_status", "") or "").upper()
+        if upd_status:
+            if upd_status == "OK":
+                parts.append("Mailbox updated")
+            elif upd_status.startswith("ERR"):
+                err = row.get("update_error", "") or "Error"
+                parts.append(f"Mailbox update failed: {err}")
+            else:
+                parts.append(f"Mailbox update: {upd_status}")
+
+        fwd_status = str(row.get("forwarding_status", "") or "").upper()
+        if fwd_status:
+            if fwd_status == "OK":
+                parts.append("Forwarding updated")
+            elif fwd_status.startswith("ERR"):
+                err = row.get("forwarding_error", "") or "Error"
+                parts.append(f"Forwarding failed: {err}")
+            else:
+                parts.append(f"Forwarding: {fwd_status}")
+
+        export_status = str(row.get("smartlead_export_status", "") or "").upper()
+        if export_status:
+            if export_status == "OK":
+                parts.append("Smartlead export ready")
+            elif export_status.startswith("ERR"):
+                err = row.get("smartlead_export_error", "") or "Error"
+                parts.append(f"Smartlead export failed: {err}")
+            else:
+                parts.append(f"Smartlead export: {export_status}")
+
+        return "; ".join(parts) if parts else "No changes applied"
+
+    report["changes_done"] = report.apply(_summarize, axis=1)
+    report["updated_forwarding_status"] = report["forwarding_status"].apply(
+        _human_yes_no
+    )
+    return report
+
+
 def _categorize_row(row: pd.Series) -> str:
     statuses = []
     for col in ["update_status", "forwarding_status", "smartlead_export_status"]:
@@ -276,6 +348,7 @@ if uploaded:
             forward_series = df[forward_col].fillna("").astype(str).str.strip()
 
         work = df.copy()
+        work["input_email"] = work[email_col].astype(str)
         work.rename(columns={email_col: "email"}, inplace=True)
         work["email"] = work["email"].astype(str).str.strip().str.lower()
         parsed = work["email"].apply(parse_email)
@@ -382,11 +455,9 @@ if uploaded:
             )
 
         unique_domains = sorted(d for d in normalized_domains.unique() if d)
-        domain_found = 0
-        domain_failed = 0
-        
+        domain_counts = {"found": 0, "failed": 0}
+
         def resolve_domain_lookups(domains: List[str], *, use_cache: bool = True):
-            nonlocal domain_found, domain_failed
             if not domains:
                 return
             with st.status("Resolving domain UIDs...", expanded=False) as domain_status:
@@ -404,7 +475,7 @@ if uploaded:
                         st.session_state["data"].loc[mask, "domain_uid"] = cached["uid"]
                         st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                         st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                        domain_found += 1
+                        domain_counts["found"] += 1
                         _log_progress("Domain lookups (cached)", i, total_domains)
                     else:
                         uid, err, code = client.get_domain_uid(domain_value)
@@ -418,13 +489,13 @@ if uploaded:
                             st.session_state["data"].loc[mask, "domain_uid"] = uid
                             st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                             st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                            domain_found += 1
+                            domain_counts["found"] += 1
                             _log_progress("Domain lookups", i, total_domains)
                         else:
                             st.session_state["data"].loc[mask, "domain_uid"] = None
                             st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
                             st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                            domain_failed += 1
+                            domain_counts["failed"] += 1
                             logger.error(
                                 f"Domain lookup failed for {domain_value}: {err or 'Lookup failed'} (HTTP {http_display})"
                             )
@@ -438,7 +509,7 @@ if uploaded:
         summary_message = (
             "UID mapping finished. "
             f"Mailboxes found {found}, failed {bad}. "
-            f"Domains resolved {domain_found}, failed {domain_failed}."
+            f"Domains resolved {domain_counts['found']}, failed {domain_counts['failed']}."
         )
         st.success(summary_message)
         logger.info(summary_message)
@@ -1013,6 +1084,21 @@ if uploaded:
             )
 
         show_results_summary(st.session_state["data"])
+
+        final_report = build_final_report(st.session_state["data"])
+        if not final_report.empty:
+            final_csv = final_report.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download final report CSV",
+                data=final_csv,
+                file_name="final_results.csv",
+                mime="text/csv",
+                key="download_final_report_csv",
+                help=(
+                    "Complete run output including original email, normalized email, "
+                    "status per step, and a concise change summary."
+                ),
+            )
 
         st.divider()
         st.subheader("Status Updates")
