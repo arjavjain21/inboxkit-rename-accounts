@@ -458,6 +458,12 @@ if uploaded:
                         ready.at[idx, "update_status"] = "ERR"
                         ready.at[idx, "update_http"] = http_code
                         ready.at[idx, "update_error"] = err or ""
+                        logger.error(
+                            "Mailbox update failed for UID %s (email: %s): %s",
+                            row.get("uid"),
+                            row.get("email"),
+                            err or "Unknown error",
+                        )
                         fail += 1
                     progress.progress(i / total, text=f"Updating... {i}/{total}")
 
@@ -471,6 +477,9 @@ if uploaded:
                     st.warning(summary)
                 else:
                     st.success(summary)
+                st.info(
+                    f"Batch summary: ✅ {ok} successful, ❌ {fail} failed out of {total} processed."
+                )
                 st.session_state["status_messages"].append(summary)
                 show_preview(preview_placeholder, "Preview after updates")
                 st.session_state["update_done"] = bool(total)
