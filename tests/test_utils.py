@@ -77,29 +77,15 @@ def test_evaluate_smartlead_export_skips_when_no_uids():
     assert level == "info"
 
 
-def test_evaluate_smartlead_export_available_when_forwarding_errors():
-    eligible, ready, message, level = evaluate_smartlead_export(
+def test_evaluate_smartlead_export_skip_due_to_forwarding_errors():
+    _, ready, message, level = evaluate_smartlead_export(
         forwarding_success=False,
         updates_ok=True,
         mailbox_uids=["UID-1"],
     )
 
-    assert eligible == ["UID-1"]
-    assert ready is True
-    assert "forwarding errors" in message
-    assert level == "warning"
-
-
-def test_evaluate_smartlead_export_available_when_update_errors():
-    eligible, ready, message, level = evaluate_smartlead_export(
-        forwarding_success=True,
-        updates_ok=False,
-        mailbox_uids=["UID-1", "UID-2"],
-    )
-
-    assert eligible == ["UID-1", "UID-2"]
-    assert ready is True
-    assert "mailbox updates failed" in message
+    assert ready is False
+    assert message == "Smartlead export skipped due to forwarding errors."
     assert level == "warning"
 
 
