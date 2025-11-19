@@ -39,8 +39,8 @@ Open the app in your browser, upload a CSV, then follow the two steps: Map UIDs,
 
 ## CSV format
 
-Required: `email` column.  
-Optional: `first_name`, `last_name`, `user_name`.  
+Required: `email` column (used to derive `username` + `domain` for UID lookups and domain resolution).
+Optional: `first_name`, `last_name`, `user_name` (the new username to apply during updates), and forwarding targets such as `forwarding_url` / `forwarding_to`.
 You can select different column names in the UI if your headers differ.
 
 See `sample_data/example.csv` for a template.
