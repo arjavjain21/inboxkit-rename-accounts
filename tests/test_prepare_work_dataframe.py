@@ -10,27 +10,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from app import _prepare_work_dataframe
 
 
-def test_prepare_work_dataframe_extracts_username_from_new_email_column():
+def test_prepare_work_dataframe_sets_user_name_from_column():
     df = pd.DataFrame(
         [
             {
                 "email": "old@example.com",
-                "new_email": "renamed@example.com",
-            }
-        ]
-    )
-
-    work = _prepare_work_dataframe(df, "email", None, None, None, None, "new_email")
-
-    assert list(work["user_name"]) == ["renamed"]
-
-
-def test_prepare_work_dataframe_keeps_explicit_username_over_new_email():
-    df = pd.DataFrame(
-        [
-            {
-                "email": "old@example.com",
-                "new_email": "renamed@example.com",
                 "custom_username": "preferred",
             }
         ]
@@ -43,7 +27,18 @@ def test_prepare_work_dataframe_keeps_explicit_username_over_new_email():
         None,
         "custom_username",
         None,
-        "new_email",
     )
 
     assert list(work["user_name"]) == ["preferred"]
+
+
+def test_prepare_work_dataframe_leaves_user_name_blank_when_missing():
+    df = pd.DataFrame([
+        {
+            "email": "old@example.com",
+        }
+    ])
+
+    work = _prepare_work_dataframe(df, "email", None, None, None, None)
+
+    assert list(work["user_name"]) == [""]
