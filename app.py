@@ -151,6 +151,9 @@ def _prepare_work_dataframe(
         raise ValueError("Email column selection is invalid")
 
     work = df.copy()
+    user_col_values = None
+    if user_col and user_col in work.columns:
+        user_col_values = work[user_col].copy()
     work["input_email"] = work[email_col].astype(str)
     work.rename(columns={email_col: "email"}, inplace=True)
     work["email"] = work["email"].astype(str).str.strip().str.lower()
@@ -182,8 +185,8 @@ def _prepare_work_dataframe(
         work["last_name"] = work[last_col].astype(str)
     else:
         work["last_name"] = ""
-    if user_col and user_col in work.columns:
-        work["user_name"] = work[user_col].astype(str)
+    if user_col_values is not None:
+        work["user_name"] = user_col_values.astype(str)
     else:
         work["user_name"] = ""
     if forward_col and forward_col in work.columns:
@@ -414,15 +417,17 @@ def _log_progress(label: str, current: int, total: int) -> None:
 
 
 def show_preview(placeholder, note: Optional[str] = None) -> None:
-    data = st.session_state.get("data")
+    raw_data = st.session_state.get("raw_data")
+    data = raw_data if isinstance(raw_data, pd.DataFrame) else None
     if data is None:
-        placeholder.empty()
-        return
+        data = st.session_state.get("data")
+        if data is None:
+            placeholder.empty()
+            return
     with placeholder.container():
         if note:
             st.caption(note)
-        ordered_cols = _ordered_columns(data)
-        st.dataframe(data.loc[:, ordered_cols].head(5))
+        st.dataframe(data.head(5))
 
 
 with st.sidebar:

@@ -42,3 +42,26 @@ def test_prepare_work_dataframe_leaves_user_name_blank_when_missing():
     work = _prepare_work_dataframe(df, "email", None, None, None, None)
 
     assert list(work["user_name"]) == [""]
+
+
+def test_prepare_work_dataframe_preserves_user_column_even_when_named_username():
+    df = pd.DataFrame(
+        [
+            {
+                "email": "someone@example.com",
+                "username": "new-login",
+            }
+        ]
+    )
+
+    work = _prepare_work_dataframe(
+        df,
+        "email",
+        None,
+        None,
+        "username",
+        None,
+    )
+
+    assert list(work["user_name"]) == ["new-login"]
+    assert list(work["username"]) == ["someone"]
