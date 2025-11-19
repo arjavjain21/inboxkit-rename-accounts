@@ -125,6 +125,17 @@ FORWARDING_ALIASES = {
     "forwarding",
 }
 
+NEW_EMAIL_ALIASES = {
+    "new_email",
+    "newemail",
+    "updated_email",
+    "updatedemail",
+    "target_email",
+    "targetemail",
+    "final_email",
+    "finalemail",
+}
+
 
 def _detect_column(df: pd.DataFrame, aliases: set[str]) -> Optional[str]:
     normalized_aliases = {_normalize_column_name(alias) for alias in aliases}
@@ -147,6 +158,7 @@ def _prepare_work_dataframe(
     last_col: Optional[str],
     user_col: Optional[str],
     forward_col: Optional[str],
+    new_email_col: Optional[str],
 ) -> pd.DataFrame:
     if email_col not in df.columns:
         raise ValueError("Email column selection is invalid")
@@ -189,6 +201,12 @@ def _prepare_work_dataframe(
         work["user_name"] = ""
     if forward_col and forward_col in work.columns:
         work["forwarding_url"] = work[forward_col].fillna("").astype(str).str.strip()
+
+    if new_email_col and new_email_col in work.columns:
+        parsed_new = work[new_email_col].astype(str).apply(parse_email)
+        new_usernames = parsed_new.apply(lambda x: x[0] if x else "")
+        existing_mask = work["user_name"].astype(str).str.strip() != ""
+        work.loc[~existing_mask, "user_name"] = new_usernames.loc[~existing_mask]
 
     return work
 
@@ -237,13 +255,34 @@ def _persist_current_session(token: Optional[str]) -> None:
     persist_session_state(token, data, metadata)
 
 
+def _compose_new_email(row: pd.Series) -> str:
+    """Return the mailbox email after updates succeed.
+
+    The workflow renames an inbox by posting the desired ``user_name`` to
+    ``/v1/api/mailboxes/update``. That value only becomes the actual mailbox
+    address when the update request returns ``OK``. We keep the original email
+    for rows that were not updated or failed so the final report clearly shows
+    which mailboxes still need attention.
+    """
+
+    base_email = str(row.get("email") or row.get("input_email") or "").strip()
+    user_name = str(row.get("user_name") or "").strip()
+    domain = str(row.get("domain") or "").strip()
+    update_status = str(row.get("update_status") or "").strip().upper()
+
+    if update_status == "OK" and user_name and domain:
+        return f"{user_name}@{domain}".lower()
+
+    return base_email
+
+
 def build_final_report(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
     report = pd.DataFrame()
     report["input_email"] = df.get("input_email", df.get("email", pd.Series(dtype=str)))
-    report["new_email"] = df.get("email", pd.Series(dtype=str))
+    report["new_email"] = df.apply(_compose_new_email, axis=1)
     report["uid"] = df.get("uid", pd.Series(dtype=str))
     report["domain_uid"] = df.get("domain_uid", pd.Series(dtype=str))
     report["forwarding_url"] = df.get("forwarding_url", pd.Series(dtype=str))
@@ -539,6 +578,7 @@ if uploaded:
         last_default = _detect_column(raw_df, LAST_NAME_ALIASES)
         user_default = _detect_column(raw_df, USERNAME_ALIASES)
         forward_default = _detect_column(raw_df, FORWARDING_ALIASES)
+        new_email_default = _detect_column(raw_df, NEW_EMAIL_ALIASES)
 
         first_col = st.selectbox(
             "First name column (optional)",
@@ -558,6 +598,12 @@ if uploaded:
             index=_safe_select_index(optional_options, user_default or "<none>"),
             key=f"user_col_{token}",
         )
+        new_email_col = st.selectbox(
+            "New email column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, new_email_default or "<none>"),
+            key=f"new_email_col_{token}",
+        )
         forward_col = st.selectbox(
             "Forwarding URL column (optional)",
             options=optional_options,
@@ -572,6 +618,7 @@ if uploaded:
             None if last_col == "<none>" else last_col,
             None if user_col == "<none>" else user_col,
             None if forward_col == "<none>" else forward_col,
+            None if new_email_col == "<none>" else new_email_col,
         )
         st.session_state["data"] = work
         _persist_current_session(st.session_state.get("upload_token"))
