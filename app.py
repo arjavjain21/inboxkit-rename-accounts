@@ -213,38 +213,6 @@ def _collect_exportable_uids(df: Optional[pd.DataFrame]) -> List[str]:
     return [uid for uid in dict.fromkeys(ordered) if uid]
 
 
-def _fill_forwarding_urls_from_domain(df: Optional[pd.DataFrame]) -> bool:
-    """Backfill empty forwarding URLs using other rows from the same domain."""
-
-    if df is None:
-        return False
-    if "forwarding_url" not in df.columns or "domain" not in df.columns:
-        return False
-
-    domains = df["domain"].fillna("").astype(str).str.strip().str.lower()
-    urls = df["forwarding_url"].fillna("").astype(str).str.strip()
-
-    if domains.empty:
-        return False
-
-    domain_to_url: dict[str, str] = {}
-    for domain_value, url in zip(domains, urls):
-        if domain_value and url and domain_value not in domain_to_url:
-            domain_to_url[domain_value] = url
-
-    if not domain_to_url:
-        return False
-
-    missing_mask = (urls == "") & domains.isin(domain_to_url)
-    if not missing_mask.any():
-        return False
-
-    df.loc[missing_mask, "forwarding_url"] = (
-        domains.loc[missing_mask].map(domain_to_url).fillna("").values
-    )
-    return True
-
-
 def _human_yes_no(value: str) -> str:
     normalized = str(value or "").strip().upper()
     return "yes" if normalized == "OK" else "no"
@@ -972,43 +940,54 @@ if uploaded:
         st.subheader("Step 3: Update Forwarding")
 
         current = st.session_state["data"].copy()
-        if _fill_forwarding_urls_from_domain(current):
-            st.session_state["data"] = current
-            st.caption(
-                "Filled forwarding URLs for rows that share a domain with one that already had a value."
-            )
-
-        uid_required = current["uid"].fillna("").astype(str).str.strip()
-        domain_required = current["domain_uid"].fillna("").astype(str).str.strip()
-        forwarding_required = current["forwarding_url"].fillna("").astype(str).str.strip()
-
-        missing_uid_forward = uid_required == ""
-        missing_domain_uid = domain_required == ""
-        missing_forwarding_url = forwarding_required == ""
-
-        skipped_forwarding_rows = int(
-            (missing_uid_forward | missing_domain_uid | missing_forwarding_url).sum()
+        forwarding_required = (
+            current.get("forwarding_url", pd.Series(dtype=str))
+            .fillna("")
+            .astype(str)
+            .str.strip()
         )
-        if skipped_forwarding_rows:
-            messages = []
-            if missing_uid_forward.any():
-                messages.append(f"{int(missing_uid_forward.sum())} row(s) missing mailbox UID")
-            if missing_domain_uid.any():
-                messages.append(f"{int(missing_domain_uid.sum())} row(s) missing domain UID")
-            if missing_forwarding_url.any():
-                messages.append(
-                    f"{int(missing_forwarding_url.sum())} row(s) missing forwarding URL"
+        has_forwarding_urls = forwarding_required.ne("").any()
+
+        if not has_forwarding_urls:
+            st.info(
+                "No forwarding URLs provided. Skipping forwarding updates. You can proceed to "
+                "Smartlead export as soon as mailbox updates finish."
+            )
+        else:
+            uid_required = current["uid"].fillna("").astype(str).str.strip()
+            domain_required = current["domain_uid"].fillna("").astype(str).str.strip()
+
+            missing_uid_forward = uid_required == ""
+            missing_domain_uid = domain_required == ""
+            missing_forwarding_url = forwarding_required == ""
+
+            skipped_forwarding_rows = int(
+                (missing_uid_forward | missing_domain_uid | missing_forwarding_url).sum()
+            )
+            if skipped_forwarding_rows:
+                messages = []
+                if missing_uid_forward.any():
+                    messages.append(
+                        f"{int(missing_uid_forward.sum())} row(s) missing mailbox UID"
+                    )
+                if missing_domain_uid.any():
+                    messages.append(
+                        f"{int(missing_domain_uid.sum())} row(s) missing domain UID"
+                    )
+                if missing_forwarding_url.any():
+                    messages.append(
+                        f"{int(missing_forwarding_url.sum())} row(s) missing forwarding URL"
+                    )
+                st.warning(
+                    "Forwarding updates will skip rows with incomplete data:\n- "
+                    + "\n- ".join(messages)
                 )
-            st.warning(
-                "Forwarding updates will skip rows with incomplete data:\n- "
-                + "\n- ".join(messages)
+
+            processable_mask = (~missing_uid_forward) & (~missing_domain_uid) & (
+                ~missing_forwarding_url
             )
 
-        processable_mask = (~missing_uid_forward) & (~missing_domain_uid) & (
-            ~missing_forwarding_url
-        )
-
-        if st.button("Update Forwarding"):
+            if st.button("Update Forwarding"):
             try:
                 client = InboxKitClient(
                     base_url=base_url,
