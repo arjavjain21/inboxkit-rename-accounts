@@ -237,13 +237,34 @@ def _persist_current_session(token: Optional[str]) -> None:
     persist_session_state(token, data, metadata)
 
 
+def _compose_new_email(row: pd.Series) -> str:
+    """Return the mailbox email after updates succeed.
+
+    The workflow renames an inbox by posting the desired ``user_name`` to
+    ``/v1/api/mailboxes/update``. That value only becomes the actual mailbox
+    address when the update request returns ``OK``. We keep the original email
+    for rows that were not updated or failed so the final report clearly shows
+    which mailboxes still need attention.
+    """
+
+    base_email = str(row.get("email") or row.get("input_email") or "").strip()
+    user_name = str(row.get("user_name") or "").strip()
+    domain = str(row.get("domain") or "").strip()
+    update_status = str(row.get("update_status") or "").strip().upper()
+
+    if update_status == "OK" and user_name and domain:
+        return f"{user_name}@{domain}".lower()
+
+    return base_email
+
+
 def build_final_report(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
     report = pd.DataFrame()
     report["input_email"] = df.get("input_email", df.get("email", pd.Series(dtype=str)))
-    report["new_email"] = df.get("email", pd.Series(dtype=str))
+    report["new_email"] = df.apply(_compose_new_email, axis=1)
     report["uid"] = df.get("uid", pd.Series(dtype=str))
     report["domain_uid"] = df.get("domain_uid", pd.Series(dtype=str))
     report["forwarding_url"] = df.get("forwarding_url", pd.Series(dtype=str))
