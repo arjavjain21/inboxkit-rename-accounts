@@ -73,6 +73,178 @@ def _ordered_columns(df: pd.DataFrame) -> List[str]:
     return ordered
 
 
+def _normalize_column_name(name: str) -> str:
+    return (
+        str(name or "")
+        .strip()
+        .lower()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+
+EMAIL_ALIASES = {
+    "email",
+    "emails",
+    "emailaddress",
+    "emailaddr",
+    "emailid",
+    "mail",
+    "mailaddress",
+    "e-mail",
+}
+FIRST_NAME_ALIASES = {
+    "firstname",
+    "first_name",
+    "fname",
+    "givenname",
+    "given_name",
+}
+LAST_NAME_ALIASES = {
+    "lastname",
+    "last_name",
+    "lname",
+    "surname",
+    "familyname",
+}
+USERNAME_ALIASES = {
+    "username",
+    "user_name",
+    "user",
+    "login",
+    "loginname",
+}
+FORWARDING_ALIASES = {
+    "forwardingurl",
+    "forwardingto",
+    "forwardto",
+    "forwardurl",
+    "forwardingaddress",
+    "forwardaddress",
+    "forwarding",
+}
+
+
+def _detect_column(df: pd.DataFrame, aliases: set[str]) -> Optional[str]:
+    normalized_aliases = {_normalize_column_name(alias) for alias in aliases}
+    for column in df.columns:
+        if _normalize_column_name(column) in normalized_aliases:
+            return column
+    return None
+
+
+def _safe_select_index(options: List[str], preferred: Optional[str]) -> int:
+    if preferred and preferred in options:
+        return options.index(preferred)
+    return 0
+
+
+def _prepare_work_dataframe(
+    df: pd.DataFrame,
+    email_col: str,
+    first_col: Optional[str],
+    last_col: Optional[str],
+    user_col: Optional[str],
+    forward_col: Optional[str],
+) -> pd.DataFrame:
+    if email_col not in df.columns:
+        raise ValueError("Email column selection is invalid")
+
+    work = df.copy()
+    work["input_email"] = work[email_col].astype(str)
+    work.rename(columns={email_col: "email"}, inplace=True)
+    work["email"] = work["email"].astype(str).str.strip().str.lower()
+    parsed = work["email"].apply(parse_email)
+    work["username"] = parsed.apply(lambda x: x[0] if x else None)
+    work["domain"] = parsed.apply(lambda x: x[1] if x else None)
+    work["uid"] = None
+    work["uid_status"] = ""
+    work["uid_http"] = ""
+    work["domain_uid"] = None
+    work["domain_uid_status"] = ""
+    work["domain_uid_http"] = ""
+    work["forwarding_url"] = ""
+    work["forwarding_status"] = ""
+    work["forwarding_http"] = ""
+    work["forwarding_error"] = ""
+    work["update_status"] = ""
+    work["update_http"] = ""
+    work["update_error"] = ""
+    work["smartlead_export_status"] = ""
+    work["smartlead_export_http"] = ""
+    work["smartlead_export_error"] = ""
+
+    if first_col and first_col in work.columns:
+        work["first_name"] = work[first_col].astype(str)
+    else:
+        work["first_name"] = ""
+    if last_col and last_col in work.columns:
+        work["last_name"] = work[last_col].astype(str)
+    else:
+        work["last_name"] = ""
+    if user_col and user_col in work.columns:
+        work["user_name"] = work[user_col].astype(str)
+    else:
+        work["user_name"] = ""
+    if forward_col and forward_col in work.columns:
+        work["forwarding_url"] = work[forward_col].fillna("").astype(str).str.strip()
+
+    return work
+
+
+def _collect_exportable_uids(df: Optional[pd.DataFrame]) -> List[str]:
+    """Return unique mailbox UIDs that were successfully updated."""
+
+    if df is None or "uid" not in df.columns:
+        return []
+
+    uid_series = df["uid"].fillna("").astype(str).str.strip()
+    if "update_status" in df.columns:
+        status_series = df["update_status"].fillna("").astype(str).str.upper()
+        eligible_mask = uid_series.ne("") & status_series.eq("OK")
+    else:
+        eligible_mask = uid_series.ne("")
+
+    if not eligible_mask.any():
+        return []
+
+    ordered = uid_series.loc[eligible_mask].tolist()
+    return [uid for uid in dict.fromkeys(ordered) if uid]
+
+
+def _fill_forwarding_urls_from_domain(df: Optional[pd.DataFrame]) -> bool:
+    """Backfill empty forwarding URLs using other rows from the same domain."""
+
+    if df is None:
+        return False
+    if "forwarding_url" not in df.columns or "domain" not in df.columns:
+        return False
+
+    domains = df["domain"].fillna("").astype(str).str.strip().str.lower()
+    urls = df["forwarding_url"].fillna("").astype(str).str.strip()
+
+    if domains.empty:
+        return False
+
+    domain_to_url: dict[str, str] = {}
+    for domain_value, url in zip(domains, urls):
+        if domain_value and url and domain_value not in domain_to_url:
+            domain_to_url[domain_value] = url
+
+    if not domain_to_url:
+        return False
+
+    missing_mask = (urls == "") & domains.isin(domain_to_url)
+    if not missing_mask.any():
+        return False
+
+    df.loc[missing_mask, "forwarding_url"] = (
+        domains.loc[missing_mask].map(domain_to_url).fillna("").values
+    )
+    return True
+
+
 def _human_yes_no(value: str) -> str:
     normalized = str(value or "").strip().upper()
     return "yes" if normalized == "OK" else "no"
@@ -297,6 +469,8 @@ if "update_done" not in st.session_state:
     st.session_state["update_done"] = False
 if "upload_token" not in st.session_state:
     st.session_state["upload_token"] = None
+if "raw_data" not in st.session_state:
+    st.session_state["raw_data"] = None
 if "status_messages" not in st.session_state:
     st.session_state["status_messages"] = []
 if "smartlead_export_done" not in st.session_state:
@@ -345,8 +519,10 @@ if uploaded:
         st.session_state["smartlead_export_ready"] = False
         st.session_state["smartlead_export_context"] = None
         st.session_state["domain_uid_cache"] = {}
+        st.session_state["raw_data"] = None
+        st.session_state["data"] = None
 
-    if st.session_state["data"] is None or new_upload:
+    if st.session_state.get("raw_data") is None:
         # Need a fresh buffer per read attempt
         file_bytes = io.BytesIO(file_bytes_raw)
         try:
@@ -370,98 +546,75 @@ if uploaded:
 
         # Normalize columns
         df.columns = [c.strip() for c in df.columns]
-        # Make sure required column exists or allow selection
-        email_col = None
-        candidates = [c for c in df.columns if c.lower() in ("email", "emails", "email_id", "e-mail")]
-        if len(candidates) == 1:
-            email_col = candidates[0]
-        else:
-            email_col = st.selectbox("Select the email column", options=df.columns.tolist())
+        st.session_state["raw_data"] = df
 
-        # Optional fields
-        first_col = None
-        last_col = None
-        user_col = None
-        forward_col = None
-        for c in df.columns:
-            lc = c.lower()
-            if lc == "first_name" or lc == "firstname":
-                first_col = c
-            if lc == "last_name" or lc == "lastname":
-                last_col = c
-            if lc == "user_name" or lc == "username":
-                user_col = c
-            normalized_forward = lc.replace("-", "_").replace(" ", "_")
-            if normalized_forward in {
-                "forwarding_url",
-                "forwarding_to",
-                "forward_to",
-                "forwarding",
-            }:
-                forward_col = c
-
-        first_col = st.selectbox("First name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(first_col) if first_col else 0)
-        last_col = st.selectbox("Last name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(last_col) if last_col else 0)
-        user_col = st.selectbox("Username column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(user_col) if user_col else 0)
-        forward_col = st.selectbox("Forwarding URL column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(forward_col) if forward_col else 0)
-
-        # Clean and prepare
-        user_series = None
-        if user_col != "<none>":
-            user_series = df[user_col].astype(str)
-        forward_series = None
-        if forward_col != "<none>":
-            forward_series = df[forward_col].fillna("").astype(str).str.strip()
-
-        work = df.copy()
-        work["input_email"] = work[email_col].astype(str)
-        work.rename(columns={email_col: "email"}, inplace=True)
-        work["email"] = work["email"].astype(str).str.strip().str.lower()
-        parsed = work["email"].apply(parse_email)
-        work["username"] = parsed.apply(lambda x: x[0] if x else None)
-        work["domain"] = parsed.apply(lambda x: x[1] if x else None)
-        work["uid"] = None
-        work["uid_status"] = ""
-        work["uid_http"] = ""
-        work["domain_uid"] = None
-        work["domain_uid_status"] = ""
-        work["domain_uid_http"] = ""
-        work["forwarding_url"] = ""
-        work["forwarding_status"] = ""
-        work["forwarding_http"] = ""
-        work["forwarding_error"] = ""
-        work["update_status"] = ""
-        work["update_http"] = ""
-        work["update_error"] = ""
-        work["smartlead_export_status"] = ""
-        work["smartlead_export_http"] = ""
-        work["smartlead_export_error"] = ""
-
-        if first_col != "<none>":
-            work["first_name"] = work[first_col].astype(str)
-        else:
-            work["first_name"] = ""
-        if last_col != "<none>":
-            work["last_name"] = work[last_col].astype(str)
-        else:
-            work["last_name"] = ""
-        if user_series is not None:
-            work["user_name"] = user_series
-        else:
-            work["user_name"] = ""
-        if forward_series is not None:
-            work["forwarding_url"] = forward_series
-
-        st.session_state["data"] = work
-        _persist_current_session(token)
-
-    st.subheader("Preview")
     preview_placeholder = st.empty()
-    show_preview(preview_placeholder)
+    raw_df = st.session_state.get("raw_data")
+    if raw_df is not None and not st.session_state.get("uid_mapped"):
+        columns = raw_df.columns.tolist()
+        if not columns:
+            st.error("Uploaded CSV does not contain any columns.")
+            st.stop()
 
-    st.divider()
-    st.subheader("Step 1: Map UIDs")
-    st.write("We will try multiple lookup strategies unless you force a mode in the sidebar.")
+        email_default = _detect_column(raw_df, EMAIL_ALIASES) or columns[0]
+        email_options = columns
+        email_index = _safe_select_index(email_options, email_default)
+        email_col = st.selectbox(
+            "Select the email column",
+            options=email_options,
+            index=email_index,
+            key=f"email_col_{token}",
+        )
+
+        optional_options = ["<none>"] + columns
+        first_default = _detect_column(raw_df, FIRST_NAME_ALIASES)
+        last_default = _detect_column(raw_df, LAST_NAME_ALIASES)
+        user_default = _detect_column(raw_df, USERNAME_ALIASES)
+        forward_default = _detect_column(raw_df, FORWARDING_ALIASES)
+
+        first_col = st.selectbox(
+            "First name column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, first_default or "<none>"),
+            key=f"first_col_{token}",
+        )
+        last_col = st.selectbox(
+            "Last name column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, last_default or "<none>"),
+            key=f"last_col_{token}",
+        )
+        user_col = st.selectbox(
+            "Username column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, user_default or "<none>"),
+            key=f"user_col_{token}",
+        )
+        forward_col = st.selectbox(
+            "Forwarding URL column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, forward_default or "<none>"),
+            key=f"forward_col_{token}",
+        )
+
+        work = _prepare_work_dataframe(
+            raw_df,
+            email_col,
+            None if first_col == "<none>" else first_col,
+            None if last_col == "<none>" else last_col,
+            None if user_col == "<none>" else user_col,
+            None if forward_col == "<none>" else forward_col,
+        )
+        st.session_state["data"] = work
+        _persist_current_session(st.session_state.get("upload_token"))
+
+    if st.session_state.get("data") is not None:
+        st.subheader("Preview")
+        show_preview(preview_placeholder)
+
+        st.divider()
+        st.subheader("Step 1: Map UIDs")
+        st.write("We will try multiple lookup strategies unless you force a mode in the sidebar.")
 
     if st.button("Map UIDs now"):
         missing = []
@@ -784,12 +937,47 @@ if uploaded:
                 st.session_state["status_messages"].append(summary)
                 show_preview(preview_placeholder, "Preview after updates")
                 st.session_state["update_done"] = bool(total)
+
+                candidate_uids = _collect_exportable_uids(ready)
+                (
+                    eligible_uids,
+                    export_ready,
+                    export_status_message,
+                    export_level,
+                ) = evaluate_smartlead_export(
+                    forwarding_success=True,
+                    updates_ok=(fail == 0),
+                    mailbox_uids=candidate_uids,
+                )
+
+                if export_ready:
+                    st.session_state["smartlead_export_context"] = {
+                        "eligible_uids": eligible_uids
+                    }
+                    st.session_state["smartlead_export_ready"] = True
+                else:
+                    st.session_state["smartlead_export_context"] = None
+                    st.session_state["smartlead_export_ready"] = False
+
+                if export_status_message:
+                    if export_level == "warning":
+                        st.warning(export_status_message)
+                    else:
+                        st.info(export_status_message)
+                    st.session_state["status_messages"].append(export_status_message)
+
                 _persist_current_session(token)
 
         st.divider()
         st.subheader("Step 3: Update Forwarding")
 
         current = st.session_state["data"].copy()
+        if _fill_forwarding_urls_from_domain(current):
+            st.session_state["data"] = current
+            st.caption(
+                "Filled forwarding URLs for rows that share a domain with one that already had a value."
+            )
+
         uid_required = current["uid"].fillna("").astype(str).str.strip()
         domain_required = current["domain_uid"].fillna("").astype(str).str.strip()
         forwarding_required = current["forwarding_url"].fillna("").astype(str).str.strip()
@@ -1016,15 +1204,6 @@ if uploaded:
                         + "\n- ".join(error_messages)
                     )
 
-                mailbox_uids_series = (
-                    data_copy.loc[processable_mask, "uid"]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                    if "uid" in data_copy.columns
-                    else pd.Series(dtype=str)
-                )
-
                 forwarding_success = failure_count == 0
                 update_status_series = data_copy.get("update_status")
                 updates_ok = bool(st.session_state.get("update_done"))
@@ -1038,11 +1217,12 @@ if uploaded:
                         .any()
                     )
 
+                candidate_uids = _collect_exportable_uids(data_copy)
                 eligible_uids, export_ready, export_status_message, export_level = (
                     evaluate_smartlead_export(
                         forwarding_success,
                         updates_ok,
-                        mailbox_uids_series.tolist(),
+                        candidate_uids,
                     )
                 )
 
@@ -1053,14 +1233,11 @@ if uploaded:
                 )
 
                 if export_status_message:
-                    if export_ready:
-                        logger.info(export_status_message)
-                        st.info(export_status_message)
+                    if export_level == "warning":
+                        logger.warning(export_status_message)
+                        st.warning(export_status_message)
                     else:
-                        if export_level == "warning":
-                            logger.warning(export_status_message)
-                        else:
-                            logger.info(export_status_message)
+                        logger.info(export_status_message)
                         st.info(export_status_message)
                     st.session_state["status_messages"].append(export_status_message)
 
