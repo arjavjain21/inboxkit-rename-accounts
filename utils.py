@@ -152,12 +152,26 @@ def evaluate_smartlead_export(
     normalized = [str(uid).strip() for uid in mailbox_uids if uid is not None]
     eligible = [uid for uid in dict.fromkeys(normalized) if uid]
 
-    if forwarding_success and updates_ok and eligible:
+    if eligible:
+        if forwarding_success and updates_ok:
+            message = (
+                f"Smartlead export ready for {len(eligible)} mailbox(es). "
+                "Click \"Export Inboxes\" to proceed."
+            )
+            return eligible, True, message, "info"
+
+        if not forwarding_success:
+            message = (
+                f"Smartlead export available for {len(eligible)} mailbox(es), "
+                "but forwarding errors were detected."
+            )
+            return eligible, True, message, "warning"
+
         message = (
-            f"Smartlead export ready for {len(eligible)} mailbox(es). "
-            "Click \"Export Inboxes\" to proceed."
+            f"Smartlead export available for {len(eligible)} mailbox(es), "
+            "but some mailbox updates failed."
         )
-        return eligible, True, message, "info"
+        return eligible, True, message, "warning"
 
     if forwarding_success and updates_ok:
         message = "Smartlead export skipped: no mailbox UIDs available."
