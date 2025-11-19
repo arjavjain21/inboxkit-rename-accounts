@@ -1,10 +1,14 @@
+import json
 import logging
 import os
 import re
+import tempfile
+from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 
 EMAIL_REGEX = re.compile(r"^\s*([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*$")
+PERSIST_DIR = Path(tempfile.gettempdir()) / "inboxkit_sessions"
 
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("inboxkit_tool")
@@ -148,12 +152,26 @@ def evaluate_smartlead_export(
     normalized = [str(uid).strip() for uid in mailbox_uids if uid is not None]
     eligible = [uid for uid in dict.fromkeys(normalized) if uid]
 
-    if forwarding_success and updates_ok and eligible:
+    if eligible:
+        if forwarding_success and updates_ok:
+            message = (
+                f"Smartlead export ready for {len(eligible)} mailbox(es). "
+                "Click \"Export Inboxes\" to proceed."
+            )
+            return eligible, True, message, "info"
+
+        if not forwarding_success:
+            message = (
+                f"Smartlead export available for {len(eligible)} mailbox(es), "
+                "but forwarding errors were detected."
+            )
+            return eligible, True, message, "warning"
+
         message = (
-            f"Smartlead export ready for {len(eligible)} mailbox(es). "
-            "Click \"Export Inboxes\" to proceed."
+            f"Smartlead export available for {len(eligible)} mailbox(es), "
+            "but some mailbox updates failed."
         )
-        return eligible, True, message, "info"
+        return eligible, True, message, "warning"
 
     if forwarding_success and updates_ok:
         message = "Smartlead export skipped: no mailbox UIDs available."
@@ -225,3 +243,71 @@ def apply_smartlead_export_outcome(
     df.loc[eligible_mask, "smartlead_export_error"] = export_error or "Unknown error"
     message = f"Smartlead export failed: {export_error or 'Unknown error'}"
     return df, message, http_display, "error", "error", False
+
+
+def persist_session_state(token: str, df: pd.DataFrame, metadata: dict) -> None:
+    """Persist the prepared DataFrame and metadata for the upload token."""
+
+    if not token or df is None:
+        return
+
+    PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+    token_dir = PERSIST_DIR / token
+    token_dir.mkdir(parents=True, exist_ok=True)
+
+    data_path = token_dir / "data.csv"
+    meta_path = token_dir / "meta.json"
+
+    try:
+        df.to_csv(data_path, index=False)
+        with meta_path.open("w", encoding="utf-8") as f:
+            json.dump(metadata or {}, f)
+    except Exception:
+        # Best-effort persistence; failures should not break the app.
+        return
+
+
+def load_persisted_session(token: str) -> Optional[Tuple[pd.DataFrame, dict]]:
+    """Load a persisted session payload for the given upload token."""
+
+    if not token:
+        return None
+
+    token_dir = PERSIST_DIR / token
+    data_path = token_dir / "data.csv"
+    meta_path = token_dir / "meta.json"
+
+    if not data_path.exists() or not meta_path.exists():
+        return None
+
+    try:
+        df = pd.read_csv(data_path)
+        with meta_path.open("r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        return df, metadata
+    except Exception:
+        return None
+
+
+def clear_persisted_session(token: str) -> None:
+    """Remove persisted artifacts for the provided token."""
+
+    if not token:
+        return
+
+    token_dir = PERSIST_DIR / token
+    if not token_dir.exists():
+        return
+
+    for path in token_dir.glob("*"):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+    try:
+        token_dir.rmdir()
+    except Exception:
+        pass

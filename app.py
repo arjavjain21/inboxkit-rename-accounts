@@ -1,15 +1,25 @@
 import hashlib
 import io
+import sys
+from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
 import streamlit as st
+
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from utils import (
     annotate_skip_statuses,
     apply_smartlead_export_outcome,
+    clear_persisted_session,
     evaluate_smartlead_export,
+    load_persisted_session,
     parse_email,
     read_csv_robust,
+    persist_session_state,
     setup_logger,
 )
 from inboxkit_client import InboxKitClient, InboxKitError
@@ -61,6 +71,276 @@ def _ordered_columns(df: pd.DataFrame) -> List[str]:
     ordered = [col for col in preferred if col in df.columns]
     ordered.extend(col for col in df.columns if col not in ordered)
     return ordered
+
+
+def _normalize_column_name(name: str) -> str:
+    return (
+        str(name or "")
+        .strip()
+        .lower()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+
+EMAIL_ALIASES = {
+    "email",
+    "emails",
+    "emailaddress",
+    "emailaddr",
+    "emailid",
+    "mail",
+    "mailaddress",
+    "e-mail",
+}
+FIRST_NAME_ALIASES = {
+    "firstname",
+    "first_name",
+    "fname",
+    "givenname",
+    "given_name",
+}
+LAST_NAME_ALIASES = {
+    "lastname",
+    "last_name",
+    "lname",
+    "surname",
+    "familyname",
+}
+USERNAME_ALIASES = {
+    "username",
+    "user_name",
+    "user",
+    "login",
+    "loginname",
+}
+FORWARDING_ALIASES = {
+    "forwardingurl",
+    "forwardingto",
+    "forwardto",
+    "forwardurl",
+    "forwardingaddress",
+    "forwardaddress",
+    "forwarding",
+}
+
+NEW_EMAIL_ALIASES = {
+    "new_email",
+    "newemail",
+    "updated_email",
+    "updatedemail",
+    "target_email",
+    "targetemail",
+    "final_email",
+    "finalemail",
+}
+
+
+def _detect_column(df: pd.DataFrame, aliases: set[str]) -> Optional[str]:
+    normalized_aliases = {_normalize_column_name(alias) for alias in aliases}
+    for column in df.columns:
+        if _normalize_column_name(column) in normalized_aliases:
+            return column
+    return None
+
+
+def _safe_select_index(options: List[str], preferred: Optional[str]) -> int:
+    if preferred and preferred in options:
+        return options.index(preferred)
+    return 0
+
+
+def _prepare_work_dataframe(
+    df: pd.DataFrame,
+    email_col: str,
+    first_col: Optional[str],
+    last_col: Optional[str],
+    user_col: Optional[str],
+    forward_col: Optional[str],
+    new_email_col: Optional[str],
+) -> pd.DataFrame:
+    if email_col not in df.columns:
+        raise ValueError("Email column selection is invalid")
+
+    work = df.copy()
+    work["input_email"] = work[email_col].astype(str)
+    work.rename(columns={email_col: "email"}, inplace=True)
+    work["email"] = work["email"].astype(str).str.strip().str.lower()
+    parsed = work["email"].apply(parse_email)
+    work["username"] = parsed.apply(lambda x: x[0] if x else None)
+    work["domain"] = parsed.apply(lambda x: x[1] if x else None)
+    work["uid"] = None
+    work["uid_status"] = ""
+    work["uid_http"] = ""
+    work["domain_uid"] = None
+    work["domain_uid_status"] = ""
+    work["domain_uid_http"] = ""
+    work["forwarding_url"] = ""
+    work["forwarding_status"] = ""
+    work["forwarding_http"] = ""
+    work["forwarding_error"] = ""
+    work["update_status"] = ""
+    work["update_http"] = ""
+    work["update_error"] = ""
+    work["smartlead_export_status"] = ""
+    work["smartlead_export_http"] = ""
+    work["smartlead_export_error"] = ""
+
+    if first_col and first_col in work.columns:
+        work["first_name"] = work[first_col].astype(str)
+    else:
+        work["first_name"] = ""
+    if last_col and last_col in work.columns:
+        work["last_name"] = work[last_col].astype(str)
+    else:
+        work["last_name"] = ""
+    if user_col and user_col in work.columns:
+        work["user_name"] = work[user_col].astype(str)
+    else:
+        work["user_name"] = ""
+    if forward_col and forward_col in work.columns:
+        work["forwarding_url"] = work[forward_col].fillna("").astype(str).str.strip()
+
+    if new_email_col and new_email_col in work.columns:
+        parsed_new = work[new_email_col].astype(str).apply(parse_email)
+        new_usernames = parsed_new.apply(lambda x: x[0] if x else "")
+        existing_mask = work["user_name"].astype(str).str.strip() != ""
+        work.loc[~existing_mask, "user_name"] = new_usernames.loc[~existing_mask]
+
+    return work
+
+
+def _collect_exportable_uids(df: Optional[pd.DataFrame]) -> List[str]:
+    """Return unique mailbox UIDs that were successfully updated."""
+
+    if df is None or "uid" not in df.columns:
+        return []
+
+    uid_series = df["uid"].fillna("").astype(str).str.strip()
+    if "update_status" in df.columns:
+        status_series = df["update_status"].fillna("").astype(str).str.upper()
+        eligible_mask = uid_series.ne("") & status_series.eq("OK")
+    else:
+        eligible_mask = uid_series.ne("")
+
+    if not eligible_mask.any():
+        return []
+
+    ordered = uid_series.loc[eligible_mask].tolist()
+    return [uid for uid in dict.fromkeys(ordered) if uid]
+
+
+def _human_yes_no(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    return "yes" if normalized == "OK" else "no"
+
+
+def _persist_current_session(token: Optional[str]) -> None:
+    data = st.session_state.get("data")
+    if not token or data is None:
+        return
+
+    metadata = {
+        "uid_mapped": st.session_state.get("uid_mapped", False),
+        "update_done": st.session_state.get("update_done", False),
+        "smartlead_export_ready": st.session_state.get("smartlead_export_ready", False),
+        "smartlead_export_context": st.session_state.get(
+            "smartlead_export_context"
+        ),
+        "domain_uid_cache": st.session_state.get("domain_uid_cache", {}),
+        "smartlead_export_done": st.session_state.get("smartlead_export_done", False),
+    }
+
+    persist_session_state(token, data, metadata)
+
+
+def _compose_new_email(row: pd.Series) -> str:
+    """Return the mailbox email after updates succeed.
+
+    The workflow renames an inbox by posting the desired ``user_name`` to
+    ``/v1/api/mailboxes/update``. That value only becomes the actual mailbox
+    address when the update request returns ``OK``. We keep the original email
+    for rows that were not updated or failed so the final report clearly shows
+    which mailboxes still need attention.
+    """
+
+    base_email = str(row.get("email") or row.get("input_email") or "").strip()
+    user_name = str(row.get("user_name") or "").strip()
+    domain = str(row.get("domain") or "").strip()
+    update_status = str(row.get("update_status") or "").strip().upper()
+
+    if update_status == "OK" and user_name and domain:
+        return f"{user_name}@{domain}".lower()
+
+    return base_email
+
+
+def build_final_report(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    report = pd.DataFrame()
+    report["input_email"] = df.get("input_email", df.get("email", pd.Series(dtype=str)))
+    report["new_email"] = df.apply(_compose_new_email, axis=1)
+    report["uid"] = df.get("uid", pd.Series(dtype=str))
+    report["domain_uid"] = df.get("domain_uid", pd.Series(dtype=str))
+    report["forwarding_url"] = df.get("forwarding_url", pd.Series(dtype=str))
+    report["update_status"] = df.get("update_status", pd.Series(dtype=str))
+    report["update_http"] = df.get("update_http", pd.Series(dtype=str))
+    report["update_error"] = df.get("update_error", pd.Series(dtype=str))
+    report["forwarding_status"] = df.get("forwarding_status", pd.Series(dtype=str))
+    report["forwarding_http"] = df.get("forwarding_http", pd.Series(dtype=str))
+    report["forwarding_error"] = df.get("forwarding_error", pd.Series(dtype=str))
+    report["smartlead_export_status"] = df.get(
+        "smartlead_export_status", pd.Series(dtype=str)
+    )
+    report["smartlead_export_http"] = df.get(
+        "smartlead_export_http", pd.Series(dtype=str)
+    )
+    report["smartlead_export_error"] = df.get(
+        "smartlead_export_error", pd.Series(dtype=str)
+    )
+
+    def _summarize(row: pd.Series) -> str:
+        parts = []
+        upd_status = str(row.get("update_status", "") or "").upper()
+        if upd_status:
+            if upd_status == "OK":
+                parts.append("Mailbox updated")
+            elif upd_status.startswith("ERR"):
+                err = row.get("update_error", "") or "Error"
+                parts.append(f"Mailbox update failed: {err}")
+            else:
+                parts.append(f"Mailbox update: {upd_status}")
+
+        fwd_status = str(row.get("forwarding_status", "") or "").upper()
+        if fwd_status:
+            if fwd_status == "OK":
+                parts.append("Forwarding updated")
+            elif fwd_status.startswith("ERR"):
+                err = row.get("forwarding_error", "") or "Error"
+                parts.append(f"Forwarding failed: {err}")
+            else:
+                parts.append(f"Forwarding: {fwd_status}")
+
+        export_status = str(row.get("smartlead_export_status", "") or "").upper()
+        if export_status:
+            if export_status == "OK":
+                parts.append("Smartlead export ready")
+            elif export_status.startswith("ERR"):
+                err = row.get("smartlead_export_error", "") or "Error"
+                parts.append(f"Smartlead export failed: {err}")
+            else:
+                parts.append(f"Smartlead export: {export_status}")
+
+        return "; ".join(parts) if parts else "No changes applied"
+
+    report["changes_done"] = report.apply(_summarize, axis=1)
+    report["updated_forwarding_status"] = report["forwarding_status"].apply(
+        _human_yes_no
+    )
+    return report
 
 
 def _categorize_row(row: pd.Series) -> str:
@@ -183,7 +463,7 @@ with st.sidebar:
         st.caption("No status updates yet.")
 
 st.info(
-    "Upload a CSV with at least an **email** column. Optional columns: **first_name**, **last_name**, **user_name**, forwarding settings such as **forwarding_url** or **forwarding_to**."
+    "Upload a CSV with at least an **email** column. Optional columns: **first_name**, **last_name**, **user_name**, forwarding settings such as **forwarding_url** or **forwarding_to**. For best performance, upload **250 rows or fewer** per run."
 )
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
@@ -196,6 +476,8 @@ if "update_done" not in st.session_state:
     st.session_state["update_done"] = False
 if "upload_token" not in st.session_state:
     st.session_state["upload_token"] = None
+if "raw_data" not in st.session_state:
+    st.session_state["raw_data"] = None
 if "status_messages" not in st.session_state:
     st.session_state["status_messages"] = []
 if "smartlead_export_done" not in st.session_state:
@@ -210,8 +492,32 @@ if "domain_uid_cache" not in st.session_state:
 if uploaded:
     file_bytes_raw = uploaded.getvalue()
     token = hashlib.md5(file_bytes_raw).hexdigest()
+
+    if st.session_state.get("upload_token") != token and st.session_state.get("data") is None:
+        restored = load_persisted_session(token)
+        if restored:
+            restored_df, restored_meta = restored
+            st.session_state["data"] = restored_df
+            st.session_state["upload_token"] = token
+            st.session_state["uid_mapped"] = restored_meta.get("uid_mapped", False)
+            st.session_state["update_done"] = restored_meta.get("update_done", False)
+            st.session_state["smartlead_export_ready"] = restored_meta.get(
+                "smartlead_export_ready", False
+            )
+            st.session_state["smartlead_export_context"] = restored_meta.get(
+                "smartlead_export_context"
+            )
+            st.session_state["smartlead_export_done"] = restored_meta.get(
+                "smartlead_export_done", False
+            )
+            st.session_state["domain_uid_cache"] = restored_meta.get(
+                "domain_uid_cache", {}
+            )
     new_upload = st.session_state.get("upload_token") != token
     if new_upload:
+        previous_token = st.session_state.get("upload_token")
+        if previous_token and previous_token != token:
+            clear_persisted_session(previous_token)
         st.session_state["upload_token"] = token
         st.session_state["uid_mapped"] = False
         st.session_state["update_done"] = False
@@ -220,8 +526,10 @@ if uploaded:
         st.session_state["smartlead_export_ready"] = False
         st.session_state["smartlead_export_context"] = None
         st.session_state["domain_uid_cache"] = {}
+        st.session_state["raw_data"] = None
+        st.session_state["data"] = None
 
-    if st.session_state["data"] is None or new_upload:
+    if st.session_state.get("raw_data") is None:
         # Need a fresh buffer per read attempt
         file_bytes = io.BytesIO(file_bytes_raw)
         try:
@@ -230,98 +538,98 @@ if uploaded:
             st.error(f"Failed to read CSV: {e}")
             st.stop()
 
+        if len(df) > 250:
+            st.warning(
+                "This tool is optimized for up to 250 rows per run. "
+                "Upload a smaller file or check the box below to truncate to the first 250 rows."
+            )
+            truncate_confirmed = st.checkbox(
+                "Truncate to the first 250 rows for processing", key=f"truncate_{token}"
+            )
+            if not truncate_confirmed:
+                st.stop()
+
+            df = df.head(250)
+
         # Normalize columns
         df.columns = [c.strip() for c in df.columns]
-        # Make sure required column exists or allow selection
-        email_col = None
-        candidates = [c for c in df.columns if c.lower() in ("email", "emails", "email_id", "e-mail")]
-        if len(candidates) == 1:
-            email_col = candidates[0]
-        else:
-            email_col = st.selectbox("Select the email column", options=df.columns.tolist())
+        st.session_state["raw_data"] = df
 
-        # Optional fields
-        first_col = None
-        last_col = None
-        user_col = None
-        forward_col = None
-        for c in df.columns:
-            lc = c.lower()
-            if lc == "first_name" or lc == "firstname":
-                first_col = c
-            if lc == "last_name" or lc == "lastname":
-                last_col = c
-            if lc == "user_name" or lc == "username":
-                user_col = c
-            normalized_forward = lc.replace("-", "_").replace(" ", "_")
-            if normalized_forward in {
-                "forwarding_url",
-                "forwarding_to",
-                "forward_to",
-                "forwarding",
-            }:
-                forward_col = c
-
-        first_col = st.selectbox("First name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(first_col) if first_col else 0)
-        last_col = st.selectbox("Last name column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(last_col) if last_col else 0)
-        user_col = st.selectbox("Username column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(user_col) if user_col else 0)
-        forward_col = st.selectbox("Forwarding URL column (optional)", options=["<none>"] + df.columns.tolist(), index=(["<none>"]+df.columns.tolist()).index(forward_col) if forward_col else 0)
-
-        # Clean and prepare
-        user_series = None
-        if user_col != "<none>":
-            user_series = df[user_col].astype(str)
-        forward_series = None
-        if forward_col != "<none>":
-            forward_series = df[forward_col].fillna("").astype(str).str.strip()
-
-        work = df.copy()
-        work.rename(columns={email_col: "email"}, inplace=True)
-        work["email"] = work["email"].astype(str).str.strip().str.lower()
-        parsed = work["email"].apply(parse_email)
-        work["username"] = parsed.apply(lambda x: x[0] if x else None)
-        work["domain"] = parsed.apply(lambda x: x[1] if x else None)
-        work["uid"] = None
-        work["uid_status"] = ""
-        work["uid_http"] = ""
-        work["domain_uid"] = None
-        work["domain_uid_status"] = ""
-        work["domain_uid_http"] = ""
-        work["forwarding_url"] = ""
-        work["forwarding_status"] = ""
-        work["forwarding_http"] = ""
-        work["forwarding_error"] = ""
-        work["update_status"] = ""
-        work["update_http"] = ""
-        work["update_error"] = ""
-        work["smartlead_export_status"] = ""
-        work["smartlead_export_http"] = ""
-        work["smartlead_export_error"] = ""
-
-        if first_col != "<none>":
-            work["first_name"] = work[first_col].astype(str)
-        else:
-            work["first_name"] = ""
-        if last_col != "<none>":
-            work["last_name"] = work[last_col].astype(str)
-        else:
-            work["last_name"] = ""
-        if user_series is not None:
-            work["user_name"] = user_series
-        else:
-            work["user_name"] = ""
-        if forward_series is not None:
-            work["forwarding_url"] = forward_series
-
-        st.session_state["data"] = work
-
-    st.subheader("Preview")
     preview_placeholder = st.empty()
-    show_preview(preview_placeholder)
+    raw_df = st.session_state.get("raw_data")
+    if raw_df is not None and not st.session_state.get("uid_mapped"):
+        columns = raw_df.columns.tolist()
+        if not columns:
+            st.error("Uploaded CSV does not contain any columns.")
+            st.stop()
 
-    st.divider()
-    st.subheader("Step 1: Map UIDs")
-    st.write("We will try multiple lookup strategies unless you force a mode in the sidebar.")
+        email_default = _detect_column(raw_df, EMAIL_ALIASES) or columns[0]
+        email_options = columns
+        email_index = _safe_select_index(email_options, email_default)
+        email_col = st.selectbox(
+            "Select the email column",
+            options=email_options,
+            index=email_index,
+            key=f"email_col_{token}",
+        )
+
+        optional_options = ["<none>"] + columns
+        first_default = _detect_column(raw_df, FIRST_NAME_ALIASES)
+        last_default = _detect_column(raw_df, LAST_NAME_ALIASES)
+        user_default = _detect_column(raw_df, USERNAME_ALIASES)
+        forward_default = _detect_column(raw_df, FORWARDING_ALIASES)
+        new_email_default = _detect_column(raw_df, NEW_EMAIL_ALIASES)
+
+        first_col = st.selectbox(
+            "First name column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, first_default or "<none>"),
+            key=f"first_col_{token}",
+        )
+        last_col = st.selectbox(
+            "Last name column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, last_default or "<none>"),
+            key=f"last_col_{token}",
+        )
+        user_col = st.selectbox(
+            "Username column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, user_default or "<none>"),
+            key=f"user_col_{token}",
+        )
+        new_email_col = st.selectbox(
+            "New email column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, new_email_default or "<none>"),
+            key=f"new_email_col_{token}",
+        )
+        forward_col = st.selectbox(
+            "Forwarding URL column (optional)",
+            options=optional_options,
+            index=_safe_select_index(optional_options, forward_default or "<none>"),
+            key=f"forward_col_{token}",
+        )
+
+        work = _prepare_work_dataframe(
+            raw_df,
+            email_col,
+            None if first_col == "<none>" else first_col,
+            None if last_col == "<none>" else last_col,
+            None if user_col == "<none>" else user_col,
+            None if forward_col == "<none>" else forward_col,
+            None if new_email_col == "<none>" else new_email_col,
+        )
+        st.session_state["data"] = work
+        _persist_current_session(st.session_state.get("upload_token"))
+
+    if st.session_state.get("data") is not None:
+        st.subheader("Preview")
+        show_preview(preview_placeholder)
+
+        st.divider()
+        st.subheader("Step 1: Map UIDs")
+        st.write("We will try multiple lookup strategies unless you force a mode in the sidebar.")
 
     if st.button("Map UIDs now"):
         missing = []
@@ -382,11 +690,9 @@ if uploaded:
             )
 
         unique_domains = sorted(d for d in normalized_domains.unique() if d)
-        domain_found = 0
-        domain_failed = 0
-        
+        domain_counts = {"found": 0, "failed": 0}
+
         def resolve_domain_lookups(domains: List[str], *, use_cache: bool = True):
-            nonlocal domain_found, domain_failed
             if not domains:
                 return
             with st.status("Resolving domain UIDs...", expanded=False) as domain_status:
@@ -404,7 +710,7 @@ if uploaded:
                         st.session_state["data"].loc[mask, "domain_uid"] = cached["uid"]
                         st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                         st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                        domain_found += 1
+                        domain_counts["found"] += 1
                         _log_progress("Domain lookups (cached)", i, total_domains)
                     else:
                         uid, err, code = client.get_domain_uid(domain_value)
@@ -418,13 +724,13 @@ if uploaded:
                             st.session_state["data"].loc[mask, "domain_uid"] = uid
                             st.session_state["data"].loc[mask, "domain_uid_status"] = "OK"
                             st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                            domain_found += 1
+                            domain_counts["found"] += 1
                             _log_progress("Domain lookups", i, total_domains)
                         else:
                             st.session_state["data"].loc[mask, "domain_uid"] = None
                             st.session_state["data"].loc[mask, "domain_uid_status"] = err or "Lookup failed"
                             st.session_state["data"].loc[mask, "domain_uid_http"] = http_str
-                            domain_failed += 1
+                            domain_counts["failed"] += 1
                             logger.error(
                                 f"Domain lookup failed for {domain_value}: {err or 'Lookup failed'} (HTTP {http_display})"
                             )
@@ -438,12 +744,13 @@ if uploaded:
         summary_message = (
             "UID mapping finished. "
             f"Mailboxes found {found}, failed {bad}. "
-            f"Domains resolved {domain_found}, failed {domain_failed}."
+            f"Domains resolved {domain_counts['found']}, failed {domain_counts['failed']}."
         )
         st.success(summary_message)
         logger.info(summary_message)
         st.session_state["status_messages"].append(summary_message)
         st.session_state["uid_mapped"] = True
+        _persist_current_session(token)
         show_preview(preview_placeholder, "Preview after UID mapping")
 
         unresolved_mask = (
@@ -514,7 +821,7 @@ if uploaded:
             edited = st.data_editor(
                 manual,
                 num_rows="dynamic",
-                use_container_width=True,
+                width="stretch",
                 key="manual_uid_editor",
                 disabled=["row_index", "email", "domain"],
             )
@@ -646,206 +953,254 @@ if uploaded:
                 show_preview(preview_placeholder, "Preview after updates")
                 st.session_state["update_done"] = bool(total)
 
+                candidate_uids = _collect_exportable_uids(ready)
+                (
+                    eligible_uids,
+                    export_ready,
+                    export_status_message,
+                    export_level,
+                ) = evaluate_smartlead_export(
+                    forwarding_success=True,
+                    updates_ok=(fail == 0),
+                    mailbox_uids=candidate_uids,
+                )
+
+                if export_ready:
+                    st.session_state["smartlead_export_context"] = {
+                        "eligible_uids": eligible_uids
+                    }
+                    st.session_state["smartlead_export_ready"] = True
+                else:
+                    st.session_state["smartlead_export_context"] = None
+                    st.session_state["smartlead_export_ready"] = False
+
+                if export_status_message:
+                    if export_level == "warning":
+                        st.warning(export_status_message)
+                    else:
+                        st.info(export_status_message)
+                    st.session_state["status_messages"].append(export_status_message)
+
+                _persist_current_session(token)
+
         st.divider()
         st.subheader("Step 3: Update Forwarding")
 
         current = st.session_state["data"].copy()
-        uid_required = current["uid"].fillna("").astype(str).str.strip()
-        domain_required = current["domain_uid"].fillna("").astype(str).str.strip()
-        forwarding_required = current["forwarding_url"].fillna("").astype(str).str.strip()
-
-        missing_uid_forward = uid_required == ""
-        missing_domain_uid = domain_required == ""
-        missing_forwarding_url = forwarding_required == ""
-
-        skipped_forwarding_rows = int(
-            (missing_uid_forward | missing_domain_uid | missing_forwarding_url).sum()
+        forwarding_required = (
+            current.get("forwarding_url", pd.Series(dtype=str))
+            .fillna("")
+            .astype(str)
+            .str.strip()
         )
-        if skipped_forwarding_rows:
-            messages = []
-            if missing_uid_forward.any():
-                messages.append(f"{int(missing_uid_forward.sum())} row(s) missing mailbox UID")
-            if missing_domain_uid.any():
-                messages.append(f"{int(missing_domain_uid.sum())} row(s) missing domain UID")
-            if missing_forwarding_url.any():
-                messages.append(
-                    f"{int(missing_forwarding_url.sum())} row(s) missing forwarding URL"
+        has_forwarding_urls = forwarding_required.ne("").any()
+
+        if not has_forwarding_urls:
+            st.info(
+                "No forwarding URLs provided. Skipping forwarding updates. You can proceed to "
+                "Smartlead export as soon as mailbox updates finish."
+            )
+        else:
+            uid_required = current["uid"].fillna("").astype(str).str.strip()
+            domain_required = current["domain_uid"].fillna("").astype(str).str.strip()
+
+            missing_uid_forward = uid_required == ""
+            missing_domain_uid = domain_required == ""
+            missing_forwarding_url = forwarding_required == ""
+
+            skipped_forwarding_rows = int(
+                (missing_uid_forward | missing_domain_uid | missing_forwarding_url).sum()
+            )
+            if skipped_forwarding_rows:
+                messages = []
+                if missing_uid_forward.any():
+                    messages.append(
+                        f"{int(missing_uid_forward.sum())} row(s) missing mailbox UID"
+                    )
+                if missing_domain_uid.any():
+                    messages.append(
+                        f"{int(missing_domain_uid.sum())} row(s) missing domain UID"
+                    )
+                if missing_forwarding_url.any():
+                    messages.append(
+                        f"{int(missing_forwarding_url.sum())} row(s) missing forwarding URL"
+                    )
+                st.warning(
+                    "Forwarding updates will skip rows with incomplete data:\n- "
+                    + "\n- ".join(messages)
                 )
-            st.warning(
-                "Forwarding updates will skip rows with incomplete data:\n- "
-                + "\n- ".join(messages)
+
+            processable_mask = (~missing_uid_forward) & (~missing_domain_uid) & (
+                ~missing_forwarding_url
             )
 
-        processable_mask = (~missing_uid_forward) & (~missing_domain_uid) & (
-            ~missing_forwarding_url
-        )
-
-        if st.button("Update Forwarding"):
-            try:
-                client = InboxKitClient(
-                    base_url=base_url,
-                    bearer=bearer,
-                    workspace_id=workspace_id,
-                    uid_lookup_mode=uid_lookup_mode,
-                )
-            except InboxKitError as e:
-                st.error(str(e))
-                st.stop()
-
-            st.session_state["smartlead_export_done"] = False
-            st.session_state["smartlead_export_ready"] = False
-            st.session_state["smartlead_export_context"] = None
-
-            data_copy = current.copy()
-            processing_index = data_copy.index[processable_mask]
-
-            data_copy.loc[processing_index, "forwarding_status"] = ""
-            data_copy.loc[processing_index, "forwarding_http"] = ""
-            data_copy.loc[processing_index, "forwarding_error"] = ""
-            data_copy.loc[processing_index, "smartlead_export_status"] = ""
-            data_copy.loc[processing_index, "smartlead_export_http"] = ""
-            data_copy.loc[processing_index, "smartlead_export_error"] = ""
-
-            skip_message = "Skipped: no mailbox UID provided."
-            if missing_uid_forward.any():
-                data_copy = annotate_skip_statuses(
-                    data_copy,
-                    missing_uid_forward,
-                    skip_message,
-                    columns=("forwarding", "smartlead"),
-                )
-
-            if missing_domain_uid.any():
-                data_copy = annotate_skip_statuses(
-                    data_copy,
-                    missing_domain_uid,
-                    "Skipped: no domain UID provided.",
-                    columns=("forwarding", "smartlead"),
-                )
-
-            if missing_forwarding_url.any():
-                data_copy = annotate_skip_statuses(
-                    data_copy,
-                    missing_forwarding_url,
-                    "Skipped: no forwarding URL provided.",
-                    columns=("forwarding", "smartlead"),
-                )
-
-            domain_groups = []
-            for domain_uid_value, group in data_copy.loc[processable_mask].groupby(
-                "domain_uid"
-            ):
-                domain_uid_str = str(domain_uid_value).strip()
-                if not domain_uid_str:
-                    continue
-                domain_groups.append((domain_uid_str, group))
-
-            if not domain_groups:
-                st.info("No domains available for forwarding updates.")
-                st.session_state["data"] = data_copy
-                show_preview(
-                    preview_placeholder, "Preview after forwarding updates"
-                )
-                if skipped_forwarding_rows:
-                    st.session_state["status_messages"].append(
-                        f"Forwarding skipped: no eligible rows. Skipped {skipped_forwarding_rows} row(s)."
+            if st.button("Update Forwarding"):
+                try:
+                    client = InboxKitClient(
+                        base_url=base_url,
+                        bearer=bearer,
+                        workspace_id=workspace_id,
+                        uid_lookup_mode=uid_lookup_mode,
                     )
-            else:
-                total_domains = len(domain_groups)
-                success_count = 0
-                failure_count = 0
-                error_messages: List[str] = []
+                except InboxKitError as e:
+                    st.error(str(e))
+                    st.stop()
 
-                with st.status("Updating forwarding...", expanded=False) as forwarding_status:
-                    progress = st.progress(0, text="Starting forwarding updates...")
+                st.session_state["smartlead_export_done"] = False
+                st.session_state["smartlead_export_ready"] = False
+                st.session_state["smartlead_export_context"] = None
 
-                    for i, (domain_uid_value, group) in enumerate(domain_groups, start=1):
-                        domain_values = (
-                            group.get("domain", pd.Series(dtype=str))
-                            .fillna("")
-                            .astype(str)
-                            .str.strip()
+                data_copy = current.copy()
+                processing_index = data_copy.index[processable_mask]
+
+                data_copy.loc[processing_index, "forwarding_status"] = ""
+                data_copy.loc[processing_index, "forwarding_http"] = ""
+                data_copy.loc[processing_index, "forwarding_error"] = ""
+                data_copy.loc[processing_index, "smartlead_export_status"] = ""
+                data_copy.loc[processing_index, "smartlead_export_http"] = ""
+                data_copy.loc[processing_index, "smartlead_export_error"] = ""
+
+                skip_message = "Skipped: no mailbox UID provided."
+                if missing_uid_forward.any():
+                    data_copy = annotate_skip_statuses(
+                        data_copy,
+                        missing_uid_forward,
+                        skip_message,
+                        columns=("forwarding", "smartlead"),
+                    )
+
+                if missing_domain_uid.any():
+                    data_copy = annotate_skip_statuses(
+                        data_copy,
+                        missing_domain_uid,
+                        "Skipped: no domain UID provided.",
+                        columns=("forwarding", "smartlead"),
+                    )
+
+                if missing_forwarding_url.any():
+                    data_copy = annotate_skip_statuses(
+                        data_copy,
+                        missing_forwarding_url,
+                        "Skipped: no forwarding URL provided.",
+                        columns=("forwarding", "smartlead"),
+                    )
+
+                domain_groups = []
+                for domain_uid_value, group in data_copy.loc[processable_mask].groupby(
+                    "domain_uid"
+                ):
+                    domain_uid_str = str(domain_uid_value).strip()
+                    if not domain_uid_str:
+                        continue
+                    domain_groups.append((domain_uid_str, group))
+
+                if not domain_groups:
+                    st.info("No domains available for forwarding updates.")
+                    st.session_state["data"] = data_copy
+                    _persist_current_session(token)
+                    show_preview(
+                        preview_placeholder, "Preview after forwarding updates"
+                    )
+                    if skipped_forwarding_rows:
+                        st.session_state["status_messages"].append(
+                            f"Forwarding skipped: no eligible rows. Skipped {skipped_forwarding_rows} row(s)."
                         )
-                        domain_name = next((d for d in domain_values if d), domain_uid_value)
+                else:
+                    total_domains = len(domain_groups)
+                    success_count = 0
+                    failure_count = 0
+                    error_messages: List[str] = []
 
-                        forwarding_values = (
-                            group["forwarding_url"].fillna("").astype(str).str.strip()
-                        )
-                        unique_forwarding = sorted({v for v in forwarding_values if v})
+                    with st.status("Updating forwarding...", expanded=False) as forwarding_status:
+                        progress = st.progress(0, text="Starting forwarding updates...")
 
-                        progress.progress(
-                            min(i / total_domains, 1.0),
-                            text=f"Updating forwarding... {i}/{total_domains}",
-                        )
-
-                        if not unique_forwarding:
-                            message = (
-                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): no forwarding URL provided"
+                        for i, (domain_uid_value, group) in enumerate(domain_groups, start=1):
+                            domain_values = (
+                                group.get("domain", pd.Series(dtype=str))
+                                .fillna("")
+                                .astype(str)
+                                .str.strip()
                             )
-                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                            data_copy.loc[group.index, "forwarding_error"] = message
-                            failure_count += 1
-                            error_messages.append(message)
-                            logger.error(message)
-                            continue
+                            domain_name = next((d for d in domain_values if d), domain_uid_value)
 
-                        if len(unique_forwarding) > 1:
-                            joined_urls = ", ".join(unique_forwarding)
-                            message = (
-                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
-                                f"multiple forwarding URLs found ({joined_urls})"
+                            forwarding_values = (
+                                group["forwarding_url"].fillna("").astype(str).str.strip()
                             )
-                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                            data_copy.loc[group.index, "forwarding_error"] = message
-                            failure_count += 1
-                            error_messages.append(message)
-                            logger.error(message)
-                            continue
+                            unique_forwarding = sorted({v for v in forwarding_values if v})
 
-                        uid_values = (
-                            group["uid"].fillna("").astype(str).str.strip()
-                            if "uid" in group
-                            else pd.Series(dtype=str)
-                        )
-                        unique_mailbox_uids = sorted({uid for uid in uid_values if uid})
-
-                        if not unique_mailbox_uids:
-                            message = (
-                                f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
-                                "no mailbox UIDs available"
+                            progress.progress(
+                                min(i / total_domains, 1.0),
+                                text=f"Updating forwarding... {i}/{total_domains}",
                             )
-                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                            data_copy.loc[group.index, "forwarding_error"] = message
-                            failure_count += 1
-                            error_messages.append(message)
-                            logger.error(message)
-                            continue
 
-                        payload = {
-                            "forwarding_url": unique_forwarding[0],
-                        }
-                        success, err, code = client.update_domain_forwarding(
-                            domain_uid_value, payload
-                        )
-                        http_str = str(code) if code is not None else ""
-                        http_display = http_str or "n/a"
+                            if not unique_forwarding:
+                                message = (
+                                    f"Forwarding skipped for {domain_name} ({domain_uid_value}): no forwarding URL provided"
+                                )
+                                data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                                data_copy.loc[group.index, "forwarding_error"] = message
+                                failure_count += 1
+                                error_messages.append(message)
+                                logger.error(message)
+                                continue
 
-                        if success:
-                            data_copy.loc[group.index, "forwarding_status"] = "OK"
-                            data_copy.loc[group.index, "forwarding_http"] = http_str
-                            success_count += 1
-                            _log_progress("Forwarding updates", i, total_domains)
-                        else:
-                            error_detail = err or "Unknown error"
-                            data_copy.loc[group.index, "forwarding_status"] = "ERR"
-                            data_copy.loc[group.index, "forwarding_http"] = http_str
-                            data_copy.loc[group.index, "forwarding_error"] = error_detail
-                            failure_count += 1
-                            message = (
-                                f"Forwarding failed for {domain_name} ({domain_uid_value}): {error_detail}"
+                            if len(unique_forwarding) > 1:
+                                joined_urls = ", ".join(unique_forwarding)
+                                message = (
+                                    f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
+                                    f"multiple forwarding URLs found ({joined_urls})"
+                                )
+                                data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                                data_copy.loc[group.index, "forwarding_error"] = message
+                                failure_count += 1
+                                error_messages.append(message)
+                                logger.error(message)
+                                continue
+
+                            uid_values = (
+                                group["uid"].fillna("").astype(str).str.strip()
+                                if "uid" in group
+                                else pd.Series(dtype=str)
                             )
-                            error_messages.append(f"{message} (HTTP {http_display})")
-                            logger.error(f"{message} (HTTP {http_display})")
+                            unique_mailbox_uids = sorted({uid for uid in uid_values if uid})
+
+                            if not unique_mailbox_uids:
+                                message = (
+                                    f"Forwarding skipped for {domain_name} ({domain_uid_value}): "
+                                    "no mailbox UIDs available"
+                                )
+                                data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                                data_copy.loc[group.index, "forwarding_error"] = message
+                                failure_count += 1
+                                error_messages.append(message)
+                                logger.error(message)
+                                continue
+
+                            payload = {
+                                "forwarding_url": unique_forwarding[0],
+                            }
+                            success, err, code = client.update_domain_forwarding(
+                                domain_uid_value, payload
+                            )
+                            http_str = str(code) if code is not None else ""
+                            http_display = http_str or "n/a"
+
+                            if success:
+                                data_copy.loc[group.index, "forwarding_status"] = "OK"
+                                data_copy.loc[group.index, "forwarding_http"] = http_str
+                                success_count += 1
+                                _log_progress("Forwarding updates", i, total_domains)
+                            else:
+                                error_detail = err or "Unknown error"
+                                data_copy.loc[group.index, "forwarding_status"] = "ERR"
+                                data_copy.loc[group.index, "forwarding_http"] = http_str
+                                data_copy.loc[group.index, "forwarding_error"] = error_detail
+                                failure_count += 1
+                                message = (
+                                    f"Forwarding failed for {domain_name} ({domain_uid_value}): {error_detail}"
+                                )
+                                error_messages.append(f"{message} (HTTP {http_display})")
+                                logger.error(f"{message} (HTTP {http_display})")
                     forwarding_status.update(
                         label="Forwarding updates complete", state="complete"
                     )
@@ -875,15 +1230,6 @@ if uploaded:
                         + "\n- ".join(error_messages)
                     )
 
-                mailbox_uids_series = (
-                    data_copy.loc[processable_mask, "uid"]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                    if "uid" in data_copy.columns
-                    else pd.Series(dtype=str)
-                )
-
                 forwarding_success = failure_count == 0
                 update_status_series = data_copy.get("update_status")
                 updates_ok = bool(st.session_state.get("update_done"))
@@ -897,11 +1243,12 @@ if uploaded:
                         .any()
                     )
 
+                candidate_uids = _collect_exportable_uids(data_copy)
                 eligible_uids, export_ready, export_status_message, export_level = (
                     evaluate_smartlead_export(
                         forwarding_success,
                         updates_ok,
-                        mailbox_uids_series.tolist(),
+                        candidate_uids,
                     )
                 )
 
@@ -912,18 +1259,16 @@ if uploaded:
                 )
 
                 if export_status_message:
-                    if export_ready:
-                        logger.info(export_status_message)
-                        st.info(export_status_message)
+                    if export_level == "warning":
+                        logger.warning(export_status_message)
+                        st.warning(export_status_message)
                     else:
-                        if export_level == "warning":
-                            logger.warning(export_status_message)
-                        else:
-                            logger.info(export_status_message)
+                        logger.info(export_status_message)
                         st.info(export_status_message)
                     st.session_state["status_messages"].append(export_status_message)
 
                 st.session_state["data"] = data_copy
+                _persist_current_session(token)
                 show_preview(
                     preview_placeholder, "Preview after forwarding updates"
                 )
@@ -995,6 +1340,7 @@ if uploaded:
                     st.session_state["smartlead_export_ready"] = True
                     st.session_state["smartlead_export_context"] = export_context
 
+                _persist_current_session(token)
                 show_preview(
                     preview_placeholder, "Preview after forwarding updates"
                 )
@@ -1013,6 +1359,21 @@ if uploaded:
             )
 
         show_results_summary(st.session_state["data"])
+
+        final_report = build_final_report(st.session_state["data"])
+        if not final_report.empty:
+            final_csv = final_report.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download final report CSV",
+                data=final_csv,
+                file_name="final_results.csv",
+                mime="text/csv",
+                key="download_final_report_csv",
+                help=(
+                    "Complete run output including original email, normalized email, "
+                    "status per step, and a concise change summary."
+                ),
+            )
 
         st.divider()
         st.subheader("Status Updates")
