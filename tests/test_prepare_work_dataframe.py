@@ -65,3 +65,25 @@ def test_prepare_work_dataframe_preserves_user_column_even_when_named_username()
 
     assert list(work["user_name"]) == ["new-login"]
     assert list(work["username"]) == ["someone"]
+
+
+def test_prepare_work_dataframe_preserves_forwarding_column_when_named_forwarding_url():
+    df = pd.DataFrame(
+        [
+            {
+                "email": "someone@example.com",
+                "forwarding_url": "https://forward.example.com/ ",
+            }
+        ]
+    )
+
+    work = _prepare_work_dataframe(
+        df,
+        "email",
+        None,
+        None,
+        None,
+        "forwarding_url",
+    )
+
+    assert list(work["forwarding_url"]) == ["https://forward.example.com/"]

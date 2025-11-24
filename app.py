@@ -151,6 +151,9 @@ def _prepare_work_dataframe(
         raise ValueError("Email column selection is invalid")
 
     work = df.copy()
+    forward_col_values = None
+    if forward_col and forward_col in work.columns:
+        forward_col_values = work[forward_col].copy()
     user_col_values = None
     if user_col and user_col in work.columns:
         user_col_values = work[user_col].copy()
@@ -189,8 +192,8 @@ def _prepare_work_dataframe(
         work["user_name"] = user_col_values.astype(str)
     else:
         work["user_name"] = ""
-    if forward_col and forward_col in work.columns:
-        work["forwarding_url"] = work[forward_col].fillna("").astype(str).str.strip()
+    if forward_col_values is not None:
+        work["forwarding_url"] = forward_col_values.fillna("").astype(str).str.strip()
 
     return work
 
