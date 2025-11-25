@@ -201,82 +201,49 @@ class InboxKitClient:
 
     def find_uid_by_email(self, email: str, username: str, domain: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
         """
-        Attempt to find a mailbox UID by trying a few probable endpoints.
+        Resolve a mailbox UID via a targeted search query.
+
         Returns (uid, error_message, status_code).
         """
-        tried: List[Tuple[str, str, Optional[int]]] = []  # (path, error, status)
-        modes = [self.uid_lookup_mode] if self.uid_lookup_mode != "auto" else ["email", "search", "list"]
-        for mode in modes:
-            try:
-                if mode == "email":
-                    # Hypothetical endpoint
-                    resp = self._request("GET", "/v1/api/mailboxes/find", params={"email": email})
-                elif mode == "search":
-                    # Hypothetical search endpoint
-                    resp = self._request("GET", "/v1/api/mailboxes/search", params={"keyword": username, "domain": domain})
-                elif mode == "list":
-                    page = 1
-                    limit = 100
-                    last_status = None
-                    while True:
-                        payload = {"page": page, "limit": limit, "keyword": username, "domain": domain}
-                        resp = self._request("POST", "/v1/api/mailboxes/list", json=payload)
-                        last_status = resp.status_code
+        params = {
+            "keyword": username,
+            "domain": domain,
+            "limit": 10,
+        }
 
-                        if resp.status_code == 401:
-                            return None, "Unauthorized. Check Bearer token.", resp.status_code
-                        if resp.status_code == 404:
-                            break
-                        if resp.status_code >= 400:
-                            tried.append((mode, f"HTTP {resp.status_code}: {resp.text[:200]}", resp.status_code))
-                            break
+        try:
+            resp = self._request("GET", "/v1/api/mailboxes/search", params=params)
+        except requests.RequestException as e:
+            return None, f"Network error: {str(e)}", None
 
-                        data = None
-                        try:
-                            data = resp.json()
-                        except Exception:
-                            return None, "Invalid JSON from UID lookup", resp.status_code
+        if resp.status_code == 401:
+            return None, "Unauthorized. Check Bearer token.", resp.status_code
+        if resp.status_code == 404:
+            return None, "Mailbox not found", resp.status_code
+        if resp.status_code >= 400:
+            return None, f"HTTP {resp.status_code}: {resp.text[:200]}", resp.status_code
 
-                        matched_uid = self._find_uid_in_mailboxes(data, username, domain)
-                        if matched_uid:
-                            return matched_uid, None, resp.status_code
+        try:
+            data = resp.json()
+        except Exception:
+            return None, "Invalid JSON from UID lookup", resp.status_code
 
-                        mailboxes = self._extract_mailboxes(data)
-                        next_page = self._determine_next_page(page, data, mailboxes, limit)
-                        if not next_page or next_page <= page:
-                            break
-                        page = next_page
+        # Prefer an exact username/domain match when mailboxes are provided.
+        matched_uid = self._find_uid_in_mailboxes(data, username, domain)
+        if matched_uid:
+            return matched_uid, None, resp.status_code
 
-                    tried.append((mode, f"No mailbox matching {email} in list response", last_status))
-                    continue
-                else:
-                    return None, f"Invalid UID lookup mode: {mode}", None
+        mailboxes = self._extract_mailboxes(data)
+        if mailboxes:
+            first_uid = mailboxes[0].get("uid")
+            if isinstance(first_uid, str) and first_uid:
+                return first_uid, None, resp.status_code
 
-                if resp.status_code == 401:
-                    return None, "Unauthorized. Check Bearer token.", resp.status_code
-                if resp.status_code == 404:
-                    tried.append((mode, "Not found", resp.status_code))
-                    continue
-                if resp.status_code >= 400:
-                    tried.append((mode, f"HTTP {resp.status_code}: {resp.text[:200]}", resp.status_code))
-                    continue
+        uid = self._extract_uid(data)
+        if uid:
+            return uid, None, resp.status_code
 
-                data = None
-                try:
-                    data = resp.json()
-                except Exception:
-                    return None, "Invalid JSON from UID lookup", resp.status_code
-
-                uid = self._extract_uid(data)
-                if uid:
-                    return uid, None, resp.status_code
-                tried.append((mode, "UID not present in response", resp.status_code))
-            except requests.RequestException as e:
-                tried.append((mode, f"Network error: {str(e)}", None))
-                continue
-
-        err_summary = "; ".join([f"{m}: {e}" for m, e, _ in tried])
-        return None, f"UID lookup failed after trying modes: {err_summary}", None
+        return None, f"UID not present in search response for {email}", resp.status_code
 
     def update_mailbox(self, uid: str, first_name: Optional[str] = None, last_name: Optional[str] = None, user_name: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[int]]:
         payload: Dict[str, Any] = {"uid": uid}
