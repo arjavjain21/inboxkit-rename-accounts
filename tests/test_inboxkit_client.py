@@ -122,40 +122,6 @@ def test_update_domain_forwarding_deduplicates_domains(client):
     assert payload["uids"] == ["domain-uid", "another"]
 
 
-def test_find_uid_by_email_pagination_miss(client):
-    """Mailbox lookup fails when the paginated list omits the target mailbox."""
-
-    list_payload = {
-        "mailboxes": [
-            {
-                "username": "other",
-                "domain_name": "example.com",
-                "uid": "uid-other",
-            }
-        ]
-    }
-
-    responses = iter(
-        [
-            DummyResponse(404),  # /find 404
-            DummyResponse(404),  # /search 404
-            DummyResponse(200, list_payload),  # /list returns the wrong mailbox because limit=1
-        ]
-    )
-
-    def fake_request(method, path, **kwargs):
-        return next(responses)
-
-    with mock.patch.object(client, "_request", side_effect=fake_request):
-        uid, err, code = client.find_uid_by_email(
-            "target@example.com", "target", "example.com"
-        )
-
-    assert uid is None
-    assert "No mailbox matching target@example.com" in err
-    assert code is None
-
-
 def test_find_uid_in_mailboxes_accepts_domain_alias(client):
     """The helper recognises alternative domain keys when matching mailboxes."""
 
@@ -179,61 +145,77 @@ def test_find_uid_in_mailboxes_accepts_domain_alias(client):
     assert uid == "uid-123"
 
 
-def test_find_uid_by_email_pagination_hits_additional_pages(client):
-    """Mailbox lookup iterates through paginated responses until the target appears."""
+def test_find_uid_by_email_prefers_exact_match_then_first_result(client):
+    search_payload = {
+        "mailboxes": [
+            {
+                "username": "target",
+                "domain_name": "example.com",
+                "uid": "uid-target",
+            },
+            {
+                "username": "other",
+                "domain_name": "example.com",
+                "uid": "uid-other",
+            },
+        ]
+    }
 
-    def fake_request(method, path, **kwargs):
-        if path == "/v1/api/mailboxes/find":
-            return DummyResponse(404)
-        if path == "/v1/api/mailboxes/search":
-            return DummyResponse(404)
-        if path == "/v1/api/mailboxes/list":
-            page = kwargs["json"]["page"]
-            if page == 1:
-                return DummyResponse(
-                    200,
-                    {
-                        "mailboxes": [
-                            {
-                                "username": "other",
-                                "domain_name": "example.com",
-                                "uid": "uid-other",
-                            }
-                        ],
-                        "pagination": {"page": 1, "total_pages": 2},
-                    },
-                )
-            if page == 2:
-                return DummyResponse(
-                    200,
-                    {
-                        "mailboxes": [
-                            {
-                                "username": "target",
-                                "domain": "example.com",
-                                "uid": "uid-target",
-                            }
-                        ],
-                        "pagination": {"page": 2, "total_pages": 2},
-                    },
-                )
-            return DummyResponse(404)
-        raise AssertionError(f"Unexpected path: {path}")
-
-    recorded_payloads = []
-
-    def tracking_request(method, path, **kwargs):
-        if path == "/v1/api/mailboxes/list":
-            recorded_payloads.append(kwargs["json"])
-        return fake_request(method, path, **kwargs)
-
-    with mock.patch.object(client, "_request", side_effect=tracking_request):
-        uid, err, code = client.find_uid_by_email("target@example.com", "target", "example.com")
+    with mock.patch.object(
+        client, "_request", return_value=DummyResponse(200, search_payload)
+    ) as mocked_request:
+        uid, err, code = client.find_uid_by_email(
+            "target@example.com", "target", "example.com"
+        )
 
     assert uid == "uid-target"
     assert err is None
     assert code == 200
-    assert recorded_payloads == [
-        {"page": 1, "limit": 100, "keyword": "target", "domain": "example.com"},
-        {"page": 2, "limit": 100, "keyword": "target", "domain": "example.com"},
-    ]
+    mocked_request.assert_called_once_with(
+        "GET",
+        "/v1/api/mailboxes/search",
+        params={"keyword": "target", "domain": "example.com", "limit": 10},
+    )
+
+
+def test_find_uid_by_email_returns_first_when_no_exact_match(client):
+    search_payload = {
+        "mailboxes": [
+            {
+                "username": "other",
+                "domain_name": "example.com",
+                "uid": "uid-other",
+            },
+            {
+                "username": "another",
+                "domain_name": "example.com",
+                "uid": "uid-another",
+            },
+        ]
+    }
+
+    with mock.patch.object(
+        client, "_request", return_value=DummyResponse(200, search_payload)
+    ):
+        uid, err, code = client.find_uid_by_email(
+            "target@example.com", "target", "example.com"
+        )
+
+    assert uid == "uid-other"
+    assert err is None
+    assert code == 200
+
+
+def test_find_uid_by_email_falls_back_to_generic_uid(client):
+    search_payload = {"data": {"uid": "generic-uid"}}
+
+    with mock.patch.object(
+        client, "_request", return_value=DummyResponse(200, search_payload)
+    ):
+        uid, err, code = client.find_uid_by_email(
+            "target@example.com", "target", "example.com"
+        )
+
+    assert uid == "generic-uid"
+    assert err is None
+    assert code == 200
